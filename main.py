@@ -3,7 +3,7 @@ import os
 import cv2
 import numpy as np
 import json
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QFileDialog, QSizePolicy, QCheckBox, QSlider, QStyle, QMessageBox, QListWidget, QListWidgetItem
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QFileDialog, QSizePolicy, QCheckBox, QSlider, QStyle, QMessageBox, QListWidget, QListWidgetItem, QComboBox
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QEvent
 
@@ -75,12 +75,29 @@ class GolfTrackerApp(QMainWindow):
 
         # 궤적 보기 옵션 체크박스
         self.show_trajectory_cb = QCheckBox("궤적 전체 보기")
-        self.show_trajectory_cb.setChecked(True)
+        self.show_trajectory_cb.setChecked(False) # 기본값은 끄고 애니메이션을 켬
         self.show_trajectory_cb.setEnabled(False)
 
-        # 궤적 예측 버튼 추가
-        self.predict_traj_button = QPushButton("궤적 예측하기")
-        self.predict_traj_button.setEnabled(False)
+        # 애니메이션 모드 (Shot Tracer) 체크박스
+        self.anim_mode_cb = QCheckBox("애니메이션 모드 (Shot Tracer)")
+        self.anim_mode_cb.setChecked(True)
+        self.anim_mode_cb.setEnabled(False)
+
+        # 애니메이션 스타일 선택 콤보박스
+        self.anim_style_combo = QComboBox()
+        self.anim_style_combo.addItems([
+            "기본 트레이서 (오렌지 글로우)",
+            "블루 글로우 (파랑)",
+            "심플 레드 (빨강)",
+            "볼드 옐로우 (노랑)",
+            "그린 화살표 (Arrow)",
+            "네잎클로버 흩날리기",
+            "레드 화살표 (Red Arrow)",
+            "블루 화살표 (Blue Arrow)",
+            "퍼플 화살표 (Purple Arrow)",
+            "3D 화살표 (3D Arrow)"
+        ])
+        self.anim_style_combo.setEnabled(False)
 
         # 저장 및 불러오기 버튼 (외부용)
         self.save_traj_button = QPushButton("궤적 내보내기")
@@ -94,10 +111,23 @@ class GolfTrackerApp(QMainWindow):
         self.magnifier_label.setStyleSheet("border: 2px solid red; background-color: black; color: white;")
         self.magnifier_label.setAlignment(Qt.AlignCenter)
 
+        # 자르기 버튼 및 라벨 추가
+        self.trim_start_button = QPushButton("현재를 시작으로")
+        self.trim_start_button.setEnabled(False)
+        self.trim_end_button = QPushButton("현재를 끝으로")
+        self.trim_end_button.setEnabled(False)
+        self.save_trimmed_button = QPushButton("자른 원본 영상 저장하기")
+        self.save_trimmed_button.setEnabled(False)
+        self.export_anim_button = QPushButton("애니메이션 포함 영상 저장하기")
+        self.export_anim_button.setEnabled(False)
+        self.trim_info_label = QLabel("자르기 구간: 설정 안 됨")
+        self.trim_info_label.setAlignment(Qt.AlignCenter)
+
         self.control_layout.addWidget(self.load_button)
         self.control_layout.addWidget(self.play_button)
         self.control_layout.addWidget(self.show_trajectory_cb)
-        self.control_layout.addWidget(self.predict_traj_button)
+        self.control_layout.addWidget(self.anim_mode_cb)
+        self.control_layout.addWidget(self.anim_style_combo)
         self.control_layout.addWidget(self.save_traj_button)
         self.control_layout.addWidget(self.load_traj_button)
 
@@ -110,6 +140,15 @@ class GolfTrackerApp(QMainWindow):
         self.delete_traj_button = QPushButton("선택한 궤적 삭제")
         self.delete_traj_button.setEnabled(False)
         self.control_layout.addWidget(self.delete_traj_button)
+        
+        # 자르기 UI 추가
+        trim_layout = QHBoxLayout()
+        trim_layout.addWidget(self.trim_start_button)
+        trim_layout.addWidget(self.trim_end_button)
+        self.control_layout.addLayout(trim_layout)
+        self.control_layout.addWidget(self.trim_info_label)
+        self.control_layout.addWidget(self.save_trimmed_button)
+        self.control_layout.addWidget(self.export_anim_button)
 
         # 돋보기 영역 (Magnifier)
         self.control_layout.addSpacing(20)
@@ -133,15 +172,24 @@ class GolfTrackerApp(QMainWindow):
         self.trajectory = {}       # 프레임 인덱스를 키로 가지는 궤적 좌표 딕셔너리
         self.trajectory_modified = False  # 궤적 수정 여부 플래그
         
+        # 자르기 구간 변수
+        self.trim_start_frame = 0
+        self.trim_end_frame = -1
+
         # Connect signals
         self.load_button.clicked.connect(self.load_video)
         self.play_button.clicked.connect(self.toggle_playback)
         self.show_trajectory_cb.toggled.connect(self.redraw_current_frame)
-        self.predict_traj_button.clicked.connect(self.predict_trajectory)
+        self.anim_mode_cb.toggled.connect(self.redraw_current_frame)
+        self.anim_style_combo.currentIndexChanged.connect(self.redraw_current_frame)
         self.save_traj_button.clicked.connect(self.export_trajectory)
         self.load_traj_button.clicked.connect(self.import_trajectory)
         self.traj_list.itemClicked.connect(self.on_traj_item_clicked)
         self.delete_traj_button.clicked.connect(self.delete_selected_trajectory)
+        self.trim_start_button.clicked.connect(self.set_trim_start)
+        self.trim_end_button.clicked.connect(self.set_trim_end)
+        self.save_trimmed_button.clicked.connect(self.save_trimmed_video)
+        self.export_anim_button.clicked.connect(self.export_anim_video)
 
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -253,11 +301,23 @@ class GolfTrackerApp(QMainWindow):
                 self.display_frame(self.process_frame(frame))
                 self.play_button.setEnabled(True)
                 self.show_trajectory_cb.setEnabled(True)
-                self.predict_traj_button.setEnabled(True)
+                self.anim_mode_cb.setEnabled(True)
+                self.anim_style_combo.setEnabled(True)
                 self.timeline_slider.setEnabled(True)
                 self.save_traj_button.setEnabled(True)
                 self.load_traj_button.setEnabled(True)
                 self.delete_traj_button.setEnabled(True)
+
+                self.trim_start_button.setEnabled(True)
+                self.trim_end_button.setEnabled(True)
+                self.save_trimmed_button.setEnabled(True)
+                self.export_anim_button.setEnabled(True)
+                
+                total_frames = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.trim_start_frame = 0
+                self.trim_end_frame = max(0, total_frames - 1)
+                self.trim_info_label.setText(f"자르기 구간: {self.trim_start_frame} ~ {self.trim_end_frame}")
+
                 self.is_playing = False
                 self.play_button.setText("재생 (Space)")
                 self.update_timeline()
@@ -318,10 +378,11 @@ class GolfTrackerApp(QMainWindow):
             try:
                 with open(traj_file, 'r') as f:
                     data = json.load(f)
-                    # JSON keys are strings, convert to int
-                    self.trajectory = {int(k): tuple(v) for k, v in data.items()}
+                    # JSON keys are strings, convert to int, ensure coordinates are int
+                    self.trajectory = {int(k): (int(v[0]), int(v[1])) for k, v in data.items()}
                 self.is_object_selected = True if self.trajectory else False
                 self.trajectory_modified = False
+                self.update_traj_list()
                 print(f"궤적 자동 로드됨: {traj_file}")
             except Exception as e:
                 print(f"궤적 자동 로드 실패: {e}")
@@ -375,58 +436,6 @@ class GolfTrackerApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "오류", f"로드 실패: {e}")
 
-    def predict_trajectory(self):
-        """입력된 궤적 포인트들을 바탕으로, 시작 지점과 마지막 지점 사이의 비어있는 프레임 궤적을 예측(보간)합니다."""
-        if not self.trajectory or len(self.trajectory) < 3:
-            QMessageBox.warning(self, "경고", "궤적을 예측(보간)하려면 시작과 끝을 포함해 최소 3개 이상의 포인트가 필요합니다.")
-            return
-
-        if self.current_frame is None:
-            return
-
-        frame_h, frame_w = self.current_frame.shape[:2]
-
-        # 프레임 인덱스(t)에 따른 x, y 좌표 데이터 준비
-        sorted_frames = sorted(self.trajectory.keys())
-        t_data = np.array(sorted_frames, dtype=float)
-        points = np.array([self.trajectory[idx] for idx in sorted_frames], dtype=float)
-        x_data = points[:, 0]
-        y_data = points[:, 1]
-
-        try:
-            # 2차 다항식(포물선) 모델 피팅: x(t) = a*t^2 + b*t + c, y(t) = a*t^2 + b*t + c
-            p_x = np.polyfit(t_data, x_data, 2)
-            p_y = np.polyfit(t_data, y_data, 2)
-
-            first_t = int(sorted_frames[0])
-            last_t = int(sorted_frames[-1])
-            predicted_count = 0
-
-            # 시작 프레임부터 마지막 프레임 사이의 비어있는 구간을 예측하여 채움
-            for t in range(first_t, last_t + 1):
-                if t not in self.trajectory:
-                    pred_x = int(np.polyval(p_x, t))
-                    pred_y = int(np.polyval(p_y, t))
-
-                    # 화면 경계에 맞게 보정
-                    pred_x = max(0, min(frame_w - 1, pred_x))
-                    pred_y = max(0, min(frame_h - 1, pred_y))
-                    
-                    self.trajectory[t] = (pred_x, pred_y)
-                    predicted_count += 1
-
-            if predicted_count > 0:
-                self.trajectory_modified = True
-                self.update_traj_list()
-                self.auto_save_trajectory()
-                self.redraw_current_frame()
-                QMessageBox.information(self, "예측 완료", f"처음과 마지막 지점 사이의 비어있는 {predicted_count}개 프레임에 대한 궤적을 완성했습니다.")
-            else:
-                QMessageBox.information(self, "알림", "시작과 마지막 프레임 사이의 모든 궤적이 이미 채워져 있습니다.")
-
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"궤적 예측 중 오류가 발생했습니다: {e}")
-
     def eventFilter(self, source, event):
         # 비디오 라벨 위에서 마우스가 움직일 때 돋보기 기능 수행
         if source == self.video_label and event.type() == QEvent.MouseMove:
@@ -447,8 +456,8 @@ class GolfTrackerApp(QMainWindow):
                         click_img_x = int((x - offset_x) * (frame_w / pw))
                         click_img_y = int((y - offset_y) * (frame_h / ph))
                         
-                        # 돋보기로 보여줄 영역 크기 (원본 영상에서 40x40 픽셀을 잘라냄 -> 더 크게 확대됨)
-                        box_size = 40
+                        # 돋보기로 보여줄 영역 크기 (원본 영상에서 100x100 픽셀을 잘라냄)
+                        box_size = 100
                         x1 = max(0, click_img_x - box_size // 2)
                         y1 = max(0, click_img_y - box_size // 2)
                         x2 = min(frame_w, click_img_x + box_size // 2)
@@ -465,8 +474,8 @@ class GolfTrackerApp(QMainWindow):
                             rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
                             qt_image = QImage(rgb_roi.data, rw, rh, rw * 3, QImage.Format_RGB888)
                             
-                            # 돋보기 창 크기(150x150)에 맞춰 강제로 확대
-                            zoom_pixmap = QPixmap.fromImage(qt_image).scaled(150, 150, Qt.KeepAspectRatio, Qt.FastTransformation)
+                            # 돋보기 창 크기(400x400)에 맞춰 강제로 확대
+                            zoom_pixmap = QPixmap.fromImage(qt_image).scaled(400, 400, Qt.KeepAspectRatio, Qt.FastTransformation)
                             self.magnifier_label.setPixmap(zoom_pixmap)
             else:
                 self.magnifier_label.clear()
@@ -525,10 +534,14 @@ class GolfTrackerApp(QMainWindow):
             # 화면 즉시 갱신
             self.display_frame(self.process_frame(self.current_frame))
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, export_mode=False):
         """수동으로 입력된 좌표를 기반으로 마커와 궤적을 그립니다."""
-        # 궤적 전체 보기가 꺼져있다면 원본 프레임 반환
-        if not self.show_trajectory_cb.isChecked():
+        is_show_all = self.show_trajectory_cb.isChecked()
+        is_anim_mode = hasattr(self, 'anim_mode_cb') and self.anim_mode_cb.isChecked()
+        anim_style = self.anim_style_combo.currentIndex() if hasattr(self, 'anim_style_combo') else 0
+        
+        # 궤적 전체 보기와 애니메이션 모드가 모두 꺼져있다면 원본 프레임 반환
+        if not is_show_all and not is_anim_mode:
             return frame
             
         display_frame = frame.copy()
@@ -538,60 +551,494 @@ class GolfTrackerApp(QMainWindow):
             
         # 1. 현재 프레임에 저장된 좌표가 있다면 강조 표시
         if current_frame_idx in self.trajectory:
-            center = self.trajectory[current_frame_idx]
-            cv2.circle(display_frame, center, 10, (0, 255, 0), 2)
-            cv2.circle(display_frame, center, 2, (0, 0, 255), -1)
+            if not export_mode:
+                center = self.trajectory[current_frame_idx]
+                cv2.circle(display_frame, center, 10, (0, 255, 0), 2)
+                cv2.circle(display_frame, center, 2, (0, 0, 255), -1)
         else:
-            # 아직 좌표가 없을 때의 안내 문구
-            cv2.putText(display_frame, "Click on the ball to set position!", (50, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            if not export_mode:
+                # 아직 좌표가 없을 때의 안내 문구
+                cv2.putText(display_frame, "Click on the ball to set position!", (50, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 
-        # 2. 궤적 그리기 (체크박스 옵션에 따라 전체 선 연결)
-        if self.show_trajectory_cb.isChecked() and self.trajectory:
-            # 프레임 순서대로 정렬
-            sorted_frames = sorted(self.trajectory.keys())
-            points = [self.trajectory[idx] for idx in sorted_frames]
+        # 2. 궤적 그리기 (체크박스 옵션에 따라 선 연결)
+        if (is_show_all or is_anim_mode) and self.trajectory:
+            all_sorted_frames = sorted(self.trajectory.keys())
+            all_points = [self.trajectory[idx] for idx in all_sorted_frames]
             
-            if len(points) < 3:
+            if len(all_points) < 3:
                 # 점이 1~2개일 때는 직선으로 연결
-                for i in range(1, len(points)):
-                    cv2.line(display_frame, points[i-1], points[i], (255, 0, 0), 2)
+                if is_show_all:
+                    for i in range(1, len(all_points)):
+                        cv2.line(display_frame, all_points[i-1], all_points[i], (255, 0, 0), 2)
+                
+                if is_anim_mode:
+                    valid_frames = [f for f in all_sorted_frames if f <= current_frame_idx]
+                    points_to_draw = [self.trajectory[idx] for idx in valid_frames]
+                    for i in range(1, len(points_to_draw)):
+                        if anim_style == 0:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 200, 255), 4)
+                        elif anim_style == 1:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 200, 0), 4)
+                        elif anim_style == 2:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 0, 255), 3)
+                        elif anim_style == 3:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 255, 255), 6)
+                        elif anim_style in [4, 6, 7, 8]:
+                            color = (50, 205, 50) if anim_style == 4 else (0, 0, 255) if anim_style == 6 else (255, 100, 50) if anim_style == 7 else (255, 0, 255)
+                            cv2.arrowedLine(display_frame, points_to_draw[i-1], points_to_draw[i], color, 4, tipLength=0.3)
+                        elif anim_style == 9:
+                            p1 = points_to_draw[i-1]
+                            p2 = points_to_draw[i]
+                            # 리얼 3D 화살표 (원기둥 파이프 꼬리 + 다면체 화살촉)
+                            cv2.line(display_frame, p1, p2, (0, 60, 100), 10)
+                            cv2.line(display_frame, p1, p2, (0, 120, 200), 6)
+                            cv2.line(display_frame, p1, p2, (0, 180, 255), 2)
+                            dist = np.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            if dist > 0:
+                                ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                bc = (p2[0] - ux*25, p2[1] - uy*25)
+                                left = (int(bc[0] - uy*12), int(bc[1] + ux*12))
+                                right = (int(bc[0] + uy*12), int(bc[1] - ux*12))
+                                ridge = (int(bc[0] - ux*5), int(bc[1] - uy*5 - 15))
+                                p2_int = (int(p2[0]), int(p2[1]))
+                                cv2.fillConvexPoly(display_frame, np.array([p2_int, left, ridge], dtype=np.int32), (0, 120, 200))
+                                cv2.fillConvexPoly(display_frame, np.array([p2_int, right, ridge], dtype=np.int32), (0, 200, 255))
+                                cv2.polylines(display_frame, [np.array([p2_int, left, ridge], dtype=np.int32)], True, (0, 80, 150), 1)
+                                cv2.polylines(display_frame, [np.array([p2_int, right, ridge], dtype=np.int32)], True, (0, 150, 220), 1)
+                        elif anim_style == 5:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (144, 238, 144), 3)
+                            px, py = points_to_draw[i]
+                            ox = int((px * 17 + py * 31) % 41) - 20
+                            oy = int((px * 23 + py * 19) % 41) - 20
+                            s = int((px * 13 + py * 29) % 3) + 2
+                            cx, cy = px + ox, py + oy
+                            cv2.circle(display_frame, (cx - s, cy - s), s, (0, 200, 0), -1)
+                            cv2.circle(display_frame, (cx + s, cy - s), s, (0, 200, 0), -1)
+                            cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
+                            cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
+                            cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
             else:
                 try:
                     from scipy.interpolate import splprep, splev
-                    pts = np.array(points, dtype=float)
+                    pts = np.array(all_points, dtype=float)
                     
-                    # 스플라인 차수 (최대 3차)
-                    k = min(3, len(points) - 1)
+                    k = min(3, len(all_points) - 1)
+                    smoothing_factor = len(all_points) * 10
                     
-                    # s: 평활화 파라미터 (Smoothing condition).
-                    # 너무 크면(polyfit처럼) 좌표와 동떨어진 선이 그려지고, 
-                    # 너무 작으면 마우스 수전증 때문에 선이 꼬불꼬불해집니다.
-                    # 점 개수 * 10 정도로 설정하면, 각 점에서 평균 약 3픽셀(루트10) 정도의 오차만 
-                    # 허용하며 가장 이상적이고 예쁜 포물선 궤적을 쫀득하게 그려냅니다.
-                    smoothing_factor = len(points) * 10
+                    f_min = all_sorted_frames[0]
+                    f_max = all_sorted_frames[-1]
                     
-                    # x, y 좌표를 매개변수 곡선으로 스플라인 피팅
-                    tck, u = splprep([pts[:, 0], pts[:, 1]], s=smoothing_factor, k=k)
+                    # 프레임 인덱스(시간)를 기준으로 스플라인 매개변수 u를 생성합니다.
+                    # 이를 통해 궤적 생성 속도가 실제 공의 비행 속도와 일치하게 됩니다.
+                    if f_max > f_min:
+                        u_custom = [(f - f_min) / (f_max - f_min) for f in all_sorted_frames]
+                        tck, u = splprep([pts[:, 0], pts[:, 1]], u=u_custom, s=smoothing_factor, k=k)
+                    else:
+                        tck, u = splprep([pts[:, 0], pts[:, 1]], s=smoothing_factor, k=k)
                     
-                    # 부드러운 곡선을 그리기 위해 구간을 300개로 나눔
-                    u_new = np.linspace(0, 1, 300)
-                    x_new, y_new = splev(u_new, tck)
+                    # 1. 궤적 전체 그리기 (파란선)
+                    if is_show_all:
+                        u_full = np.linspace(0, 1, 300)
+                        x_full, y_full = splev(u_full, tck)
+                        full_pts = np.column_stack((x_full, y_full))
+                        full_curve = np.int32(full_pts).reshape((-1, 1, 2))
+                        cv2.polylines(display_frame, [full_curve], False, (255, 0, 0), 2)
                     
-                    smooth_pts = np.column_stack((x_new, y_new))
-                    
-                    # OpenCV polylines 함수를 사용하기 위해 배열 형태 변환 및 정수화
-                    curve_points = np.int32(smooth_pts).reshape((-1, 1, 2))
-                    
-                    # 파란색 부드러운 궤적 그리기
-                    cv2.polylines(display_frame, [curve_points], False, (255, 0, 0), 2)
+                    # 2. 애니메이션 (Shot Tracer) 그리기 (현재 프레임까지 길어지는 선)
+                    if is_anim_mode:
+                        u_max = 0.0
+                        if current_frame_idx >= f_max:
+                            u_max = 1.0
+                        elif current_frame_idx > f_min:
+                            # u 매개변수가 시간에 선형적으로 비례하므로 단순 비율로 계산 가능합니다.
+                            u_max = (current_frame_idx - f_min) / (f_max - f_min)
+                                    
+                        if u_max > 0.0:
+                            num_points = max(10, int(300 * u_max))
+                            u_anim = np.linspace(0, u_max, num_points)
+                            x_anim, y_anim = splev(u_anim, tck)
+                            anim_pts = np.column_stack((x_anim, y_anim))
+                            anim_curve = np.int32(anim_pts).reshape((-1, 1, 2))
+                            
+                            if anim_style == 0:
+                                # 기본 트레이서 (오렌지 글로우)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 100, 255), 8)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 200, 255), 4)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                            elif anim_style == 1:
+                                # 블루 글로우
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 100, 0), 8)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 200, 0), 4)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                            elif anim_style == 2:
+                                # 심플 레드
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 0, 255), 3)
+                            elif anim_style == 3:
+                                # 볼드 옐로우
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 255, 255), 6)
+                            elif anim_style in [4, 6, 7, 8]:
+                                # 화살표 효과들
+                                color = (50, 205, 50) if anim_style == 4 else (0, 0, 255) if anim_style == 6 else (255, 100, 50) if anim_style == 7 else (255, 0, 255)
+                                cv2.polylines(display_frame, [anim_curve], False, color, 4)
+                                if len(anim_pts) >= 2:
+                                    p2 = tuple(map(int, anim_pts[-1]))
+                                    p1 = p2
+                                    dist = 0
+                                    # 화살표 방향을 자연스럽게 잡기 위해 20픽셀 정도 떨어진 이전 궤적 점을 찾음
+                                    for idx in range(len(anim_pts)-2, -1, -1):
+                                        pt = tuple(map(int, anim_pts[idx]))
+                                        dist = np.hypot(p2[0]-pt[0], p2[1]-pt[1])
+                                        if dist >= 20:
+                                            p1 = pt
+                                            break
+                                    if p1 == p2:
+                                        p1 = tuple(map(int, anim_pts[-2]))
+                                        dist = np.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                    tip_len = 15.0 / dist if dist > 0 else 0.5
+                                    cv2.arrowedLine(display_frame, p1, p2, color, 4, tipLength=min(tip_len, 1.0))
+                            elif anim_style == 9:
+                                # 리얼 3D 화살표 (입체 파이프 & 다각형 화살촉)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 60, 100), 10)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 120, 200), 6)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 180, 255), 2)
+                                if len(anim_pts) >= 2:
+                                    p2 = tuple(map(int, anim_pts[-1]))
+                                    p1 = p2
+                                    dist = 0
+                                    for idx in range(len(anim_pts)-2, -1, -1):
+                                        pt = tuple(map(int, anim_pts[idx]))
+                                        dist = np.hypot(p2[0]-pt[0], p2[1]-pt[1])
+                                        if dist >= 20:
+                                            p1 = pt
+                                            break
+                                    if p1 == p2:
+                                        p1 = tuple(map(int, anim_pts[-2]))
+                                        dist = np.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                    if dist > 0:
+                                        ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                        bc = (p2[0] - ux*30, p2[1] - uy*30)
+                                        left = (int(bc[0] - uy*15), int(bc[1] + ux*15))
+                                        right = (int(bc[0] + uy*15), int(bc[1] - ux*15))
+                                        ridge = (int(bc[0] - ux*5), int(bc[1] - uy*5 - 20))
+                                        cv2.fillConvexPoly(display_frame, np.array([p2, left, ridge], dtype=np.int32), (0, 120, 200))
+                                        cv2.fillConvexPoly(display_frame, np.array([p2, right, ridge], dtype=np.int32), (0, 200, 255))
+                                        cv2.polylines(display_frame, [np.array([p2, left, ridge], dtype=np.int32)], True, (0, 80, 150), 1)
+                                        cv2.polylines(display_frame, [np.array([p2, right, ridge], dtype=np.int32)], True, (0, 150, 220), 1)
+                            elif anim_style == 5:
+                                # 네잎클로버 흩날리기
+                                cv2.polylines(display_frame, [anim_curve], False, (144, 238, 144), 3)
+                                for idx, pt in enumerate(anim_pts):
+                                    if idx % 8 == 0:
+                                        px, py = int(pt[0]), int(pt[1])
+                                        ox = int((px * 17 + py * 31) % 41) - 20
+                                        oy = int((px * 23 + py * 19) % 41) - 20
+                                        s = int((px * 13 + py * 29) % 3) + 2
+                                        cx, cy = px + ox, py + oy
+                                        cv2.circle(display_frame, (cx - s, cy - s), s, (0, 200, 0), -1)
+                                        cv2.circle(display_frame, (cx + s, cy - s), s, (0, 200, 0), -1)
+                                        cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
+                                        cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
+                                        cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
+                            
                 except Exception as e:
                     print(f"Curve fitting error: {e}")
-                    # 피팅 실패 시 대비 기존 직선 연결
-                    for i in range(1, len(points)):
-                        cv2.line(display_frame, points[i-1], points[i], (255, 0, 0), 2)
+                    # 피팅 실패 시 직선 연결
+                    if is_show_all:
+                        for i in range(1, len(all_points)):
+                            cv2.line(display_frame, all_points[i-1], all_points[i], (255, 0, 0), 2)
+                    if is_anim_mode:
+                        valid_frames = [f for f in all_sorted_frames if f <= current_frame_idx]
+                        points_to_draw = [self.trajectory[idx] for idx in valid_frames]
+                        for i in range(1, len(points_to_draw)):
+                            if anim_style == 0:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 200, 255), 4)
+                            elif anim_style == 1:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 200, 0), 4)
+                            elif anim_style == 2:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 0, 255), 3)
+                            elif anim_style == 3:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 255, 255), 6)
+                            elif anim_style in [4, 6, 7, 8]:
+                                color = (50, 205, 50) if anim_style == 4 else (0, 0, 255) if anim_style == 6 else (255, 100, 50) if anim_style == 7 else (255, 0, 255)
+                                cv2.arrowedLine(display_frame, points_to_draw[i-1], points_to_draw[i], color, 4, tipLength=0.3)
+                            elif anim_style == 9:
+                                p1 = points_to_draw[i-1]
+                                p2 = points_to_draw[i]
+                                cv2.line(display_frame, p1, p2, (0, 60, 100), 10)
+                                cv2.line(display_frame, p1, p2, (0, 120, 200), 6)
+                                cv2.line(display_frame, p1, p2, (0, 180, 255), 2)
+                                dist = np.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                if dist > 0:
+                                    ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                    bc = (p2[0] - ux*25, p2[1] - uy*25)
+                                    left = (int(bc[0] - uy*12), int(bc[1] + ux*12))
+                                    right = (int(bc[0] + uy*12), int(bc[1] - ux*12))
+                                    ridge = (int(bc[0] - ux*5), int(bc[1] - uy*5 - 15))
+                                    p2_int = (int(p2[0]), int(p2[1]))
+                                    cv2.fillConvexPoly(display_frame, np.array([p2_int, left, ridge], dtype=np.int32), (0, 120, 200))
+                                    cv2.fillConvexPoly(display_frame, np.array([p2_int, right, ridge], dtype=np.int32), (0, 200, 255))
+                                    cv2.polylines(display_frame, [np.array([p2_int, left, ridge], dtype=np.int32)], True, (0, 80, 150), 1)
+                                    cv2.polylines(display_frame, [np.array([p2_int, right, ridge], dtype=np.int32)], True, (0, 150, 220), 1)
+                            elif anim_style == 5:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (144, 238, 144), 3)
+                                px, py = points_to_draw[i]
+                                ox = int((px * 17 + py * 31) % 41) - 20
+                                oy = int((px * 23 + py * 19) % 41) - 20
+                                s = int((px * 13 + py * 29) % 3) + 2
+                                cx, cy = px + ox, py + oy
+                                cv2.circle(display_frame, (cx - s, cy - s), s, (0, 200, 0), -1)
+                                cv2.circle(display_frame, (cx + s, cy - s), s, (0, 200, 0), -1)
+                                cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
+                                cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
+                                cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
+
+        # 3. 다음 프레임 위치 예측 (현재까지의 궤적을 기반으로)
+        if self.is_tracking and not export_mode:
+            target_f = current_frame_idx if current_frame_idx not in self.trajectory else current_frame_idx + 1
+            past_frames = [f for f in sorted(self.trajectory.keys()) if f < target_f]
+            
+            if len(past_frames) >= 2:
+                try:
+                    # 상승 시점(초반) 예측률을 높이기 위해 최근 3개 프레임만 사용 (과거 데이터로 인한 예측 지연 방지)
+                    use_frames = past_frames[-3:]
+                    t_data = np.array(use_frames, dtype=float)
+                    points = np.array([self.trajectory[f] for f in use_frames], dtype=float)
+                    
+                    # 가장 최근 두 프레임 간의 속도(직선) 예측을 기본으로 함
+                    f1, f2 = t_data[-2], t_data[-1]
+                    p1, p2 = points[-2], points[-1]
+                    
+                    dt = f2 - f1
+                    if dt > 0:
+                        vx = (p2[0] - p1[0]) / dt
+                        vy = (p2[1] - p1[1]) / dt
+                    else:
+                        vx, vy = 0, 0
+                        
+                    dt_target = target_f - f2
+                    # 1차 예측 (등속도)
+                    pred_x_lin = p2[0] + vx * dt_target
+                    pred_y_lin = p2[1] + vy * dt_target
+                    
+                    pred_x, pred_y = pred_x_lin, pred_y_lin
+                    
+                    # 3개 이상의 프레임이 있으면 가속도를 약간 반영 (2차)
+                    if len(use_frames) == 3:
+                        f0 = t_data[0]
+                        p0 = points[0]
+                        dt0 = f1 - f0
+                        if dt0 > 0:
+                            vx0 = (p1[0] - p0[0]) / dt0
+                            vy0 = (p1[1] - p0[1]) / dt0
+                            
+                            # 가속도 계산
+                            ax = (vx - vx0) / ((dt + dt0) / 2)
+                            ay = (vy - vy0) / ((dt + dt0) / 2)
+                            
+                            # 상승 시 가속도 변화가 심할 수 있으므로 가속도(곡선) 반영 비율을 낮춤 (0.3)
+                            pred_x_acc = p2[0] + vx * dt_target + 0.5 * ax * (dt_target ** 2)
+                            pred_y_acc = p2[1] + vy * dt_target + 0.5 * ay * (dt_target ** 2)
+                            
+                            pred_x = (pred_x_lin * 0.7) + (pred_x_acc * 0.3)
+                            pred_y = (pred_y_lin * 0.7) + (pred_y_acc * 0.3)
+
+                    pred_x = int(pred_x)
+                    pred_y = int(pred_y)
+                    
+                    # 보라색 점과 십자선으로 예측 위치 표시
+                    cv2.circle(display_frame, (pred_x, pred_y), 8, (255, 0, 255), 2)
+                    cv2.line(display_frame, (pred_x - 10, pred_y), (pred_x + 10, pred_y), (255, 0, 255), 1)
+                    cv2.line(display_frame, (pred_x, pred_y - 10), (pred_x, pred_y + 10), (255, 0, 255), 1)
+                    
+                    cv2.putText(display_frame, "Predicted", (pred_x + 15, pred_y - 15), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                except Exception as e:
+                    print(f"Prediction point error: {e}")
                     
         return display_frame
+
+    def set_trim_start(self):
+        if self.video_capture is not None and self.video_capture.isOpened():
+            current_frame = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if current_frame < 0: current_frame = 0
+            if self.trim_end_frame != -1 and current_frame >= self.trim_end_frame:
+                QMessageBox.warning(self, "경고", "시작 프레임은 끝 프레임보다 앞서야 합니다.")
+                return
+            self.trim_start_frame = current_frame
+            self.trim_info_label.setText(f"자르기 구간: {self.trim_start_frame} ~ {self.trim_end_frame}")
+
+    def set_trim_end(self):
+        if self.video_capture is not None and self.video_capture.isOpened():
+            current_frame = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if current_frame < 0: current_frame = 0
+            if current_frame <= self.trim_start_frame:
+                QMessageBox.warning(self, "경고", "끝 프레임은 시작 프레임보다 뒤에 있어야 합니다.")
+                return
+            self.trim_end_frame = current_frame
+            self.trim_info_label.setText(f"자르기 구간: {self.trim_start_frame} ~ {self.trim_end_frame}")
+
+    def save_trimmed_video(self):
+        if not self.video_path or self.video_capture is None:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "자른 영상 저장", "", "Video Files (*.mp4)", options=QFileDialog.DontUseNativeDialog)
+        if not file_path:
+            return
+            
+        if not file_path.lower().endswith('.mp4'):
+            file_path += '.mp4'
+
+        # UI 응답 방지 및 안내 표시
+        self.save_trimmed_button.setText("저장 중...")
+        self.save_trimmed_button.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            import tempfile
+            import shutil
+
+            fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            if fps == 0: fps = 30
+            width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # OpenCV는 경로에 한글이 포함된 경우 저장이 실패하는 버그가 있어 임시 경로를 사용합니다.
+            temp_file_path = os.path.join(tempfile.gettempdir(), "temp_export_video.mp4")
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+
+            if not out_video.isOpened():
+                raise Exception("비디오 코덱을 초기화할 수 없습니다. mp4v 코덱을 지원하지 않을 수 있습니다.")
+
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
+            current_pos = self.trim_start_frame
+            
+            # 저장 진행률 표시용 변수
+            total_export_frames = self.trim_end_frame - self.trim_start_frame + 1
+            exported_count = 0
+
+            while current_pos <= self.trim_end_frame:
+                ret, frame = self.video_capture.read()
+                if not ret:
+                    break
+                    
+                # 원본 프레임만 자르기 저장
+                out_video.write(frame)
+                
+                exported_count += 1
+                if exported_count % 10 == 0 or exported_count == total_export_frames:
+                    progress = int((exported_count / total_export_frames) * 100)
+                    self.save_trimmed_button.setText(f"저장 중... {progress}%")
+                    QApplication.processEvents()
+
+                current_pos += 1
+            
+            out_video.release()
+            
+            # 임시로 저장된 파일을 최종 경로로 이동시킵니다.
+            shutil.move(temp_file_path, file_path)
+
+            # 궤적 데이터도 함께 맞춰서 자르고 저장
+            trimmed_traj = {}
+            for f_idx, pos in self.trajectory.items():
+                if self.trim_start_frame <= f_idx <= self.trim_end_frame:
+                    trimmed_traj[f_idx - self.trim_start_frame] = pos
+            
+            traj_file_path = os.path.splitext(file_path)[0] + "_trajectory.json"
+            with open(traj_file_path, 'w', encoding='utf-8') as f:
+                json.dump(trimmed_traj, f, indent=2)
+
+            QMessageBox.information(self, "완료", f"영상이 성공적으로 저장되었습니다.\n{file_path}\n(시작된 프레임에 맞춘 궤적 데이터도 저장됨)")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"영상 저장 중 오류가 발생했습니다: {e}")
+        finally:
+            self.save_trimmed_button.setText("자른 원본 영상 저장하기")
+            self.save_trimmed_button.setEnabled(True)
+            
+            # 완료 후 현재 위치로 복귀
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
+            ret, frame = self.video_capture.read()
+            if ret:
+                self.current_frame = frame.copy()
+                self.display_frame(self.process_frame(self.current_frame))
+                self.update_timeline()
+
+    def export_anim_video(self):
+        if not self.video_path or self.video_capture is None:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(self, "애니메이션 포함 영상 저장", "", "Video Files (*.mp4)", options=QFileDialog.DontUseNativeDialog)
+        if not file_path:
+            return
+            
+        if not file_path.lower().endswith('.mp4'):
+            file_path += '.mp4'
+
+        # UI 응답 방지 및 안내 표시
+        self.export_anim_button.setText("저장 중...")
+        self.export_anim_button.setEnabled(False)
+        QApplication.processEvents()
+
+        try:
+            import tempfile
+            import shutil
+
+            fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            if fps == 0: fps = 30
+            width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            temp_file_path = os.path.join(tempfile.gettempdir(), "temp_export_anim_video.mp4")
+
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+
+            if not out_video.isOpened():
+                raise Exception("비디오 코덱을 초기화할 수 없습니다. mp4v 코덱을 지원하지 않을 수 있습니다.")
+
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
+            current_pos = self.trim_start_frame
+            
+            total_export_frames = self.trim_end_frame - self.trim_start_frame + 1
+            exported_count = 0
+
+            while current_pos <= self.trim_end_frame:
+                ret, frame = self.video_capture.read()
+                if not ret:
+                    break
+                    
+                # 애니메이션 궤적을 렌더링하여 프레임 자체에 합성(Bake-in)
+                processed_frame = self.process_frame(frame, export_mode=True)
+                out_video.write(processed_frame)
+                
+                exported_count += 1
+                if exported_count % 10 == 0 or exported_count == total_export_frames:
+                    progress = int((exported_count / total_export_frames) * 100)
+                    self.export_anim_button.setText(f"저장 중... {progress}%")
+                    QApplication.processEvents()
+
+                current_pos += 1
+            
+            out_video.release()
+            shutil.move(temp_file_path, file_path)
+
+            QMessageBox.information(self, "완료", f"애니메이션이 포함된 영상이 성공적으로 저장되었습니다.\n{file_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"영상 저장 중 오류가 발생했습니다: {e}")
+        finally:
+            self.export_anim_button.setText("애니메이션 포함 영상 저장하기")
+            self.export_anim_button.setEnabled(True)
+            
+            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
+            ret, frame = self.video_capture.read()
+            if ret:
+                self.current_frame = frame.copy()
+                self.display_frame(self.process_frame(self.current_frame))
+                self.update_timeline()
 
     def next_frame(self):
         if self.video_capture is not None and self.video_capture.isOpened():

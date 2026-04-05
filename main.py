@@ -3,7 +3,7 @@ import os
 import cv2
 import numpy as np
 import json
-from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QFileDialog, QSizePolicy, QCheckBox, QSlider, QStyle, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QFileDialog, QSizePolicy, QCheckBox, QSlider, QStyle, QMessageBox, QListWidget, QListWidgetItem
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QEvent
 
@@ -63,7 +63,7 @@ class GolfTrackerApp(QMainWindow):
         self.control_layout = QVBoxLayout()
         
         # Controls instructions label
-        self.info_label = QLabel("조작법:\n\n[Space] 재생/일시정지\n[◀] 이전 프레임\n[▶] 다음 프레임\n\n[분석 모드 켜고]\n공을 마우스로 클릭!\n[ESC] 현재 좌표 삭제")
+        self.info_label = QLabel("조작법:\n\n[Space] 재생/일시정지\n[◀] 이전 프레임\n[▶] 다음 프레임\n\n공을 마우스로 클릭!\n[ESC] 현재 좌표 삭제")
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setStyleSheet("color: #555; font-weight: bold; margin-bottom: 20px;")
         self.control_layout.addWidget(self.info_label)
@@ -72,16 +72,15 @@ class GolfTrackerApp(QMainWindow):
         self.load_button = QPushButton("비디오 열기")
         self.play_button = QPushButton("재생 (Space)")
         self.play_button.setEnabled(False) # Disable until video is loaded
-        
-        # 분석 모드 토글 버튼 추가
-        self.track_button = QPushButton("분석 모드: 끄기")
-        self.track_button.setCheckable(True)
-        self.track_button.setEnabled(False)
 
         # 궤적 보기 옵션 체크박스
         self.show_trajectory_cb = QCheckBox("궤적 전체 보기")
         self.show_trajectory_cb.setChecked(True)
         self.show_trajectory_cb.setEnabled(False)
+
+        # 궤적 예측 버튼 추가
+        self.predict_traj_button = QPushButton("궤적 예측하기")
+        self.predict_traj_button.setEnabled(False)
 
         # 저장 및 불러오기 버튼 (외부용)
         self.save_traj_button = QPushButton("궤적 내보내기")
@@ -91,18 +90,28 @@ class GolfTrackerApp(QMainWindow):
 
         # 돋보기 영역 (Magnifier)
         self.magnifier_label = QLabel("돋보기")
-        self.magnifier_label.setFixedSize(150, 150)
+        self.magnifier_label.setFixedSize(400, 400)
         self.magnifier_label.setStyleSheet("border: 2px solid red; background-color: black; color: white;")
         self.magnifier_label.setAlignment(Qt.AlignCenter)
 
         self.control_layout.addWidget(self.load_button)
         self.control_layout.addWidget(self.play_button)
-        self.control_layout.addWidget(self.track_button)
         self.control_layout.addWidget(self.show_trajectory_cb)
+        self.control_layout.addWidget(self.predict_traj_button)
         self.control_layout.addWidget(self.save_traj_button)
         self.control_layout.addWidget(self.load_traj_button)
+
+        # 궤적 목록 리스트 추가
+        self.traj_list = QListWidget()
+        self.traj_list.setStyleSheet("background-color: white; border: 1px solid gray;")
+        self.control_layout.addWidget(self.traj_list)
         
-        # 돋보기를 제어판 하단에 추가
+        # 선택된 궤적 삭제 버튼 추가
+        self.delete_traj_button = QPushButton("선택한 궤적 삭제")
+        self.delete_traj_button.setEnabled(False)
+        self.control_layout.addWidget(self.delete_traj_button)
+
+        # 돋보기 영역 (Magnifier)
         self.control_layout.addSpacing(20)
         self.control_layout.addWidget(self.magnifier_label)
         self.control_layout.setAlignment(self.magnifier_label, Qt.AlignHCenter)
@@ -118,7 +127,7 @@ class GolfTrackerApp(QMainWindow):
         self.is_playing = False
         
         # 객체 탐지용 변수
-        self.is_tracking = False
+        self.is_tracking = False   # 트래킹/분석 모드 플래그
         self.is_object_selected = False
         self.current_frame = None  # 원본 이미지 백업용
         self.trajectory = {}       # 프레임 인덱스를 키로 가지는 궤적 좌표 딕셔너리
@@ -127,10 +136,12 @@ class GolfTrackerApp(QMainWindow):
         # Connect signals
         self.load_button.clicked.connect(self.load_video)
         self.play_button.clicked.connect(self.toggle_playback)
-        self.track_button.toggled.connect(self.toggle_tracking)
         self.show_trajectory_cb.toggled.connect(self.redraw_current_frame)
+        self.predict_traj_button.clicked.connect(self.predict_trajectory)
         self.save_traj_button.clicked.connect(self.export_trajectory)
         self.load_traj_button.clicked.connect(self.import_trajectory)
+        self.traj_list.itemClicked.connect(self.on_traj_item_clicked)
+        self.delete_traj_button.clicked.connect(self.delete_selected_trajectory)
 
         self.setFocusPolicy(Qt.StrongFocus)
         
@@ -142,6 +153,51 @@ class GolfTrackerApp(QMainWindow):
         mins = int(seconds // 60)
         secs = int(seconds % 60)
         return f"{mins:02d}:{secs:02d}"
+
+    def update_traj_list(self):
+        """궤적 리스트 UI를 갱신합니다."""
+        self.traj_list.clear()
+        if not self.trajectory:
+            return
+            
+        fps = 30
+        if self.video_capture is not None and self.video_capture.isOpened():
+            fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            if fps == 0: fps = 30
+
+        for frame_idx in sorted(self.trajectory.keys()):
+            x, y = self.trajectory[frame_idx]
+            time_sec = frame_idx / fps
+            time_str = self.format_time(time_sec)
+            item_text = f"Frame {frame_idx} ({time_str}) - X:{x}, Y:{y}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, frame_idx)
+            self.traj_list.addItem(item)
+            
+    def on_traj_item_clicked(self, item):
+        """목록에서 아이템을 클릭하면 해당 프레임으로 이동합니다."""
+        frame_idx = item.data(Qt.UserRole)
+        self.set_position(frame_idx)
+
+    def delete_selected_trajectory(self):
+        """목록에서 선택된 궤적을 삭제합니다."""
+        current_item = self.traj_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "경고", "삭제할 궤적을 목록에서 선택해주세요.")
+            return
+            
+        frame_idx = current_item.data(Qt.UserRole)
+        
+        if frame_idx in self.trajectory:
+            del self.trajectory[frame_idx]
+            self.trajectory_modified = True
+            self.update_traj_list()
+            self.auto_save_trajectory()
+            
+            if self.current_frame is not None:
+                self.display_frame(self.process_frame(self.current_frame))
+                
+            print(f"궤적 삭제됨: 프레임 {frame_idx}")
 
     def update_timeline(self):
         if self.video_capture is not None and self.video_capture.isOpened():
@@ -172,9 +228,10 @@ class GolfTrackerApp(QMainWindow):
         self.setFocus()
 
     def load_video(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "비디오 열기", "", "Video Files (*.mp4 *.avi *.mov)")
-        if file_path:
-            self.video_path = file_path
+        try:
+            file_path, _ = QFileDialog.getOpenFileName(None, "비디오 열기", "", "Video Files (*.mp4 *.avi *.mov)", options=QFileDialog.DontUseNativeDialog)
+            if file_path:
+                self.video_path = file_path
             self.video_capture = cv2.VideoCapture(file_path)
             if not self.video_capture.isOpened():
                 self.video_label.setText("비디오를 여는 데 실패했습니다.")
@@ -188,17 +245,19 @@ class GolfTrackerApp(QMainWindow):
                 self.trajectory_modified = False
                 self.tracker = None
                 self.is_object_selected = False
+                self.is_tracking = True
                 
                 # 동영상 파일명에 맞는 궤적 데이터 자동 로드
                 self.auto_load_trajectory()
                 
                 self.display_frame(self.process_frame(frame))
                 self.play_button.setEnabled(True)
-                self.track_button.setEnabled(True)
                 self.show_trajectory_cb.setEnabled(True)
+                self.predict_traj_button.setEnabled(True)
                 self.timeline_slider.setEnabled(True)
                 self.save_traj_button.setEnabled(True)
                 self.load_traj_button.setEnabled(True)
+                self.delete_traj_button.setEnabled(True)
                 self.is_playing = False
                 self.play_button.setText("재생 (Space)")
                 self.update_timeline()
@@ -206,6 +265,8 @@ class GolfTrackerApp(QMainWindow):
                 self.video_label.setText("비디오 프레임을 읽는 데 실패했습니다.")
             
             self.setFocus()
+        except Exception as e:
+            QMessageBox.critical(None, "오류", f"비디오 로드 실패: {e}")
 
     def toggle_playback(self):
         if self.video_capture is None or not self.video_capture.isOpened():
@@ -226,22 +287,6 @@ class GolfTrackerApp(QMainWindow):
             self.play_button.setText("일시정지 (Space)")
         
         self.setFocus()
-
-    def toggle_tracking(self, checked):
-        self.is_tracking = checked
-        if checked:
-            self.track_button.setText("분석 모드: 켜기")
-            # 분석 모드를 켜면 추적 상태 초기화
-            if self.trajectory:
-                self.auto_save_trajectory()  # 기존 궤적 저장
-            self.trajectory.clear()
-            self.trajectory_modified = False
-            self.tracker = None
-            self.is_object_selected = False
-        else:
-            self.track_button.setText("분석 모드: 끄기")
-            
-        self.redraw_current_frame()
 
     def redraw_current_frame(self):
         """정지 상태에서 UI 옵션이 바뀌면 현재 프레임을 다시 그립니다."""
@@ -302,7 +347,7 @@ class GolfTrackerApp(QMainWindow):
             QMessageBox.warning(self, "경고", "저장할 궤적이 없습니다.")
             return
         
-        file_path, _ = QFileDialog.getSaveFileName(self, "궤적 내보내기", "", "JSON Files (*.json)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "궤적 내보내기", "", "JSON Files (*.json)", options=QFileDialog.DontUseNativeDialog)
         if file_path:
             try:
                 with open(file_path, 'w') as f:
@@ -314,20 +359,73 @@ class GolfTrackerApp(QMainWindow):
 
     def import_trajectory(self):
         """외부 JSON 파일에서 궤적을 불러옵니다."""
-        file_path, _ = QFileDialog.getOpenFileName(self, "궤적 불러오기", "", "JSON Files (*.json)")
-        if file_path:
-            try:
+        try:
+            file_path, _ = QFileDialog.getOpenFileName(None, "궤적 불러오기", "", "JSON Files (*.json)", options=QFileDialog.DontUseNativeDialog)
+            if file_path:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
-                    # JSON keys are strings, convert to int
-                    self.trajectory = {int(k): tuple(v) for k, v in data.items()}
+                    # JSON keys are strings, convert to int, ensure coordinates are int
+                    self.trajectory = {int(k): (int(v[0]), int(v[1])) for k, v in data.items()}
                 self.is_object_selected = True if self.trajectory else False
                 self.trajectory_modified = True
+                self.update_traj_list()
                 self.redraw_current_frame()
-                QMessageBox.information(self, "완료", f"궤적이 로드되었습니다.\n프레임 수: {len(self.trajectory)}")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"로드 실패: {e}")
-            self.setFocus()
+                QMessageBox.information(None, "완료", f"궤적이 로드되었습니다.\n프레임 수: {len(self.trajectory)}")
+                self.setFocus()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"로드 실패: {e}")
+
+    def predict_trajectory(self):
+        """입력된 궤적 포인트들을 바탕으로, 시작 지점과 마지막 지점 사이의 비어있는 프레임 궤적을 예측(보간)합니다."""
+        if not self.trajectory or len(self.trajectory) < 3:
+            QMessageBox.warning(self, "경고", "궤적을 예측(보간)하려면 시작과 끝을 포함해 최소 3개 이상의 포인트가 필요합니다.")
+            return
+
+        if self.current_frame is None:
+            return
+
+        frame_h, frame_w = self.current_frame.shape[:2]
+
+        # 프레임 인덱스(t)에 따른 x, y 좌표 데이터 준비
+        sorted_frames = sorted(self.trajectory.keys())
+        t_data = np.array(sorted_frames, dtype=float)
+        points = np.array([self.trajectory[idx] for idx in sorted_frames], dtype=float)
+        x_data = points[:, 0]
+        y_data = points[:, 1]
+
+        try:
+            # 2차 다항식(포물선) 모델 피팅: x(t) = a*t^2 + b*t + c, y(t) = a*t^2 + b*t + c
+            p_x = np.polyfit(t_data, x_data, 2)
+            p_y = np.polyfit(t_data, y_data, 2)
+
+            first_t = int(sorted_frames[0])
+            last_t = int(sorted_frames[-1])
+            predicted_count = 0
+
+            # 시작 프레임부터 마지막 프레임 사이의 비어있는 구간을 예측하여 채움
+            for t in range(first_t, last_t + 1):
+                if t not in self.trajectory:
+                    pred_x = int(np.polyval(p_x, t))
+                    pred_y = int(np.polyval(p_y, t))
+
+                    # 화면 경계에 맞게 보정
+                    pred_x = max(0, min(frame_w - 1, pred_x))
+                    pred_y = max(0, min(frame_h - 1, pred_y))
+                    
+                    self.trajectory[t] = (pred_x, pred_y)
+                    predicted_count += 1
+
+            if predicted_count > 0:
+                self.trajectory_modified = True
+                self.update_traj_list()
+                self.auto_save_trajectory()
+                self.redraw_current_frame()
+                QMessageBox.information(self, "예측 완료", f"처음과 마지막 지점 사이의 비어있는 {predicted_count}개 프레임에 대한 궤적을 완성했습니다.")
+            else:
+                QMessageBox.information(self, "알림", "시작과 마지막 프레임 사이의 모든 궤적이 이미 채워져 있습니다.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"궤적 예측 중 오류가 발생했습니다: {e}")
 
     def eventFilter(self, source, event):
         # 비디오 라벨 위에서 마우스가 움직일 때 돋보기 기능 수행
@@ -419,6 +517,7 @@ class GolfTrackerApp(QMainWindow):
             self.trajectory[current_frame_idx] = (click_img_x, click_img_y)
             self.is_object_selected = True
             self.trajectory_modified = True
+            self.update_traj_list()
             
             # 궤적 자동 저장
             self.auto_save_trajectory()
@@ -428,7 +527,8 @@ class GolfTrackerApp(QMainWindow):
 
     def process_frame(self, frame):
         """수동으로 입력된 좌표를 기반으로 마커와 궤적을 그립니다."""
-        if not self.is_tracking:
+        # 궤적 전체 보기가 꺼져있다면 원본 프레임 반환
+        if not self.show_trajectory_cb.isChecked():
             return frame
             
         display_frame = frame.copy()
@@ -541,16 +641,16 @@ class GolfTrackerApp(QMainWindow):
                     self.toggle_playback()
                 self.next_frame()
             elif event.key() == Qt.Key_Escape:
-                if self.is_tracking:
-                    current_frame_idx = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-                    if current_frame_idx < 0:
-                        current_frame_idx = 0
-                    if current_frame_idx in self.trajectory:
-                        del self.trajectory[current_frame_idx]
-                        self.trajectory_modified = True
-                        self.auto_save_trajectory()
-                        if self.current_frame is not None:
-                            self.display_frame(self.process_frame(self.current_frame))
+                current_frame_idx = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                if current_frame_idx < 0:
+                    current_frame_idx = 0
+                if current_frame_idx in self.trajectory:
+                    del self.trajectory[current_frame_idx]
+                    self.trajectory_modified = True
+                    self.update_traj_list()
+                    self.auto_save_trajectory()
+                    if self.current_frame is not None:
+                        self.display_frame(self.process_frame(self.current_frame))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

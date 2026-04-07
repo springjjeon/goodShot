@@ -1,5 +1,12 @@
 import sys
 import os
+
+# PyQt5와 PyTorch 간의 DLL 충돌(WinError 1114) 방지를 위해 PyTorch를 PyQt5보다 먼저 로드합니다.
+try:
+    import torch
+except ImportError:
+    pass
+
 import cv2
 import numpy as np
 import json
@@ -95,7 +102,17 @@ class GolfTrackerApp(QMainWindow):
             "레드 화살표 (Red Arrow)",
             "블루 화살표 (Blue Arrow)",
             "퍼플 화살표 (Purple Arrow)",
-            "3D 화살표 (3D Arrow)"
+            "3D 화살표 (3D Arrow)",
+            "무지개 트레이서 (Rainbow Glow)",
+            "혜성 꼬리 (Comet Tail)",
+            "파이어볼 (Fireball)",
+            "일렉트릭 스파크 (Electric Spark)",
+            "형광 핑크빔 (Neon Pink Beam)",
+            "물수제비 (Water Ripple)",
+            "별가루 (Stardust)",
+            "디지털 글리치 (Digital Glitch)",
+            "오로라 (Aurora)",
+            "트윈 드래곤 (Twin Dragon)"
         ])
         self.anim_style_combo.setEnabled(False)
 
@@ -117,6 +134,9 @@ class GolfTrackerApp(QMainWindow):
         self.auto_calibrate_button.setEnabled(False)
         self.calibrate_button = QPushButton("📏 수동 조절")
         self.calibrate_button.setEnabled(False)
+        
+        self.auto_find_button = QPushButton("🔍 현재 화면에서 자동 공 찾기")
+        self.auto_find_button.setEnabled(False)
 
         # 돋보기 영역 (Magnifier)
         self.magnifier_label = QLabel("돋보기")
@@ -149,6 +169,9 @@ class GolfTrackerApp(QMainWindow):
         calib_layout.addWidget(self.auto_calibrate_button)
         calib_layout.addWidget(self.calibrate_button)
         self.control_layout.addLayout(calib_layout)
+        
+        # 자동 공 찾기 버튼 추가
+        self.control_layout.addWidget(self.auto_find_button)
 
         # 궤적 목록 리스트 추가
         self.traj_list = QListWidget()
@@ -211,6 +234,7 @@ class GolfTrackerApp(QMainWindow):
         self.dashboard_button.clicked.connect(self.show_dashboard)
         self.auto_calibrate_button.clicked.connect(self.auto_calibrate)
         self.calibrate_button.clicked.connect(self.start_calibration)
+        self.auto_find_button.clicked.connect(self.auto_find_ball)
         self.traj_list.itemClicked.connect(self.on_traj_item_clicked)
         self.delete_traj_button.clicked.connect(self.delete_selected_trajectory)
         self.trim_start_button.clicked.connect(self.set_trim_start)
@@ -336,6 +360,7 @@ class GolfTrackerApp(QMainWindow):
                 self.dashboard_button.setEnabled(True)
                 self.auto_calibrate_button.setEnabled(True)
                 self.calibrate_button.setEnabled(True)
+                self.auto_find_button.setEnabled(True)
                 self.delete_traj_button.setEnabled(True)
 
                 self.trim_start_button.setEnabled(True)
@@ -550,6 +575,238 @@ class GolfTrackerApp(QMainWindow):
         self.calibration_points = []
         QMessageBox.information(self, "영점 조절 시작", "영상(또는 돋보기)에 보이는 골프공의 지름을 측정합니다.\n\n공의 왼쪽 끝과 오른쪽 끝을 각각 마우스로 1번씩(총 2번) 클릭해주세요.")
         self.setFocus()
+        
+    def auto_find_ball(self):
+        """YOLOv8 AI 모델을 사용하여 사람(골퍼)을 먼저 찾고, 그 주변(발 밑)에서 공을 정밀하게 탐지합니다."""
+        if self.video_capture is None or not self.video_capture.isOpened():
+            return
+            
+        current_frame_idx = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        if current_frame_idx < 0: current_frame_idx = 0
+        
+        if self.current_frame is None:
+            return
+            
+        frame = self.current_frame.copy()
+        h, w = frame.shape[:2]
+        
+        # YOLO 모델 및 상태 초기화 (최초 1회)
+        if not hasattr(self, 'use_yolo'):
+            self.use_yolo = True
+            
+        if self.use_yolo and not hasattr(self, 'yolo_model'):
+            try:
+                from ultralytics import YOLO
+                self.auto_find_button.setText("AI 모델 로딩 중...")
+                QApplication.processEvents()
+                self.yolo_model = YOLO("yolov8n.pt")
+                self.auto_find_button.setText("🔍 현재 화면에서 자동 공 찾기")
+            except Exception as e:
+                print(f"YOLO 로딩 실패. OpenCV 대체 모드로 전환합니다: {e}")
+                self.use_yolo = False
+
+        self.auto_find_button.setText("분석 중...")
+        QApplication.processEvents()
+
+        try:
+            best_candidate = None
+            min_dist_to_feet = float('inf')
+            target_feet_x, target_feet_y = w / 2, h * 0.75 # 기본 중앙 하단
+            
+            largest_person = None
+            
+            if self.use_yolo:
+                # [YOLO 기반 정밀 탐지]
+                # 작은 골프공을 찾기 위해 입력 해상도를 높이고(imgsz=1024), 신뢰도를 대폭 낮춥니다(conf=0.05)
+                results = self.yolo_model(frame, imgsz=1024, conf=0.05, verbose=False)
+                
+                person_boxes = []
+                sports_balls = []
+                
+                for r in results:
+                    for box in r.boxes:
+                        cls_id = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        if cls_id == 0 and conf > 0.3:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            person_boxes.append((x1, y1, x2, y2))
+                        elif cls_id == 32:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            sports_balls.append((x1, y1, x2, y2, conf))
+
+                if person_boxes:
+                    largest_person = max(person_boxes, key=lambda b: (b[2]-b[0]) * (b[3]-b[1]))
+                    px1, py1, px2, py2 = largest_person
+                    target_feet_x = (px1 + px2) / 2
+                    target_feet_y = py2
+                    cv2.rectangle(frame, (int(px1), int(py1)), (int(px2), int(py2)), (255, 150, 0), 2)
+                    cv2.putText(frame, "Golfer (YOLO)", (int(px1), int(py1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 150, 0), 2)
+
+                # 이전 프레임 위치 확인 (YOLO 예측 트래킹용)
+                prev_pos = None
+                past_frames = [f for f in self.trajectory.keys() if f < current_frame_idx]
+                if past_frames:
+                    prev_f = max(past_frames)
+                    if current_frame_idx - prev_f <= 10:
+                        prev_pos = self.trajectory[prev_f]
+
+                target_x, target_y = prev_pos if prev_pos else (target_feet_x, target_feet_y)
+                yolo_candidates = []
+
+                for bx1, by1, bx2, by2, conf in sports_balls:
+                    cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+                    dist = np.hypot(cx - target_x, cy - target_y)
+                    
+                    if prev_pos:
+                        if dist < 150: # 추적 중일 땐 150픽셀 이내의 공만 유효하게 판단
+                            score = dist - (conf * 100)
+                            yolo_candidates.append((score, (int(cx), int(cy))))
+                    else:
+                        score = dist - (conf * 100)
+                        yolo_candidates.append((score, (int(cx), int(cy))))
+
+                if yolo_candidates:
+                    yolo_candidates.sort(key=lambda x: x[0])
+                    best_candidate = yolo_candidates[0][1]
+            else:
+                # [OpenCV 전용 탐지 (대체 모드)]
+                hog = cv2.HOGDescriptor()
+                hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+                # 보행자(사람) 인식
+                boxes, _ = hog.detectMultiScale(frame, winStride=(8, 8), padding=(8, 8), scale=1.05)
+                
+                if len(boxes) > 0:
+                    person_box = max(boxes, key=lambda b: b[2] * b[3])
+                    px, py, pw_box, ph_box = person_box
+                    largest_person = (px, py, px + pw_box, py + ph_box)
+                    px1, py1, px2, py2 = largest_person
+                    target_feet_x = (px1 + px2) / 2
+                    target_feet_y = py2
+                    cv2.rectangle(frame, (int(px1), int(py1)), (int(px2), int(py2)), (0, 200, 255), 2)
+                    cv2.putText(frame, "Golfer (OpenCV)", (int(px1), int(py1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 2)
+
+            if best_candidate is None:
+                # 3. 궁극의 OpenCV 하이브리드 탐색 (과거 궤적 추적 + LAB 명암 + 모션블러 허용)
+                roi_x1, roi_y1, roi_x2, roi_y2 = 0, 0, w, h
+                target_x, target_y = w / 2, h * 0.75
+                prev_pos = None
+                
+                # [핵심 로직] 직전 10프레임 이내에 마킹된 공의 위치가 있다면, 그 주변을 최우선 탐색영역으로 지정
+                past_frames = [f for f in self.trajectory.keys() if f < current_frame_idx]
+                if past_frames:
+                    prev_f = max(past_frames)
+                    if current_frame_idx - prev_f <= 10:
+                        prev_pos = self.trajectory[prev_f]
+                
+                if prev_pos:
+                    px, py = prev_pos
+                    # 이동 거리를 고려해 직전 위치 기준 160x160 영역 집중 탐색
+                    roi_x1 = max(0, px - 80)
+                    roi_x2 = min(w, px + 80)
+                    roi_y1 = max(0, py - 80)
+                    roi_y2 = min(h, py + 80)
+                    target_x, target_y = px, py
+                    cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 0), 2)
+                    cv2.putText(frame, "Tracking Area", (roi_x1, roi_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
+                elif largest_person:
+                    # 직전 기록이 없으면 골퍼의 발 주변 탐색
+                    px1, py1, px2, py2 = largest_person
+                    person_w = px2 - px1
+                    roi_x1 = max(0, int(target_feet_x - person_w * 2.0))
+                    roi_x2 = min(w, int(target_feet_x + person_w * 2.0))
+                    roi_y1 = max(0, int(target_feet_y - (py2 - py1) * 0.2))
+                    roi_y2 = min(h, int(target_feet_y + (py2 - py1) * 0.5))
+                    target_x, target_y = target_feet_x, target_feet_y
+                    cv2.rectangle(frame, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 1)
+                    cv2.putText(frame, "Golfer Feet Area", (roi_x1, roi_y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                else:
+                    roi_y1, roi_y2 = int(h * 0.4), h
+
+                roi_frame = self.current_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                if roi_frame.size > 0:
+                    candidates = []
+                    
+                    # [단계 1] LAB 색상 공간을 활용한 정밀 명암 분리
+                    lab = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
+                    l_channel, _, _ = cv2.split(lab)
+                    
+                    # CLAHE: 밝은 부분을 더 밝게 극대화 (그늘진 흰 공 탐지에 강력)
+                    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+                    cl = clahe.apply(l_channel)
+                    
+                    # [단계 2] 밝기 이진화 + 엣지 검출 융합
+                    _, thresh = cv2.threshold(cl, 200, 255, cv2.THRESH_BINARY)
+                    edges = cv2.Canny(cl, 100, 200)
+                    mask_combined = cv2.bitwise_or(thresh, edges)
+                    
+                    # 노이즈 제거 및 형태 연결
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel)
+
+                    contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    for cnt in contours:
+                        area = cv2.contourArea(cnt)
+                        if 3 < area < 800: # 공의 크기 허용 범위를 대폭 확대
+                            x, y, bw, bh = cv2.boundingRect(cnt)
+                            aspect_ratio = float(bw) / float(bh)
+                            
+                            # 날아가는 공(모션 블러)은 길쭉해지므로 찌그러진 비율(0.3~3.0)도 허용!
+                            if 0.3 <= aspect_ratio <= 3.0:
+                                perimeter = cv2.arcLength(cnt, True)
+                                if perimeter > 0:
+                                    circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                                    # 원형도 조건도 모션 블러를 고려하여 0.2로 크게 완화
+                                    if circularity > 0.2:
+                                        M = cv2.moments(cnt)
+                                        if M["m00"] != 0:
+                                            cx = int(M["m10"] / M["m00"]) + roi_x1
+                                            cy = int(M["m01"] / M["m00"]) + roi_y1
+                                            
+                                            dist = np.hypot(cx - target_x, cy - target_y)
+                                            
+                                            # [스코어링 시스템]
+                                            # 점수가 낮을수록 1순위 타겟: 거리(가까울수록) - 원형도(둥글수록 보너스) + 크기 차이
+                                            size_penalty = abs(50 - area) * 0.1
+                                            score = dist - (circularity * 50) + size_penalty
+                                            
+                                            candidates.append((score, (cx, cy)))
+
+                    if candidates:
+                        # 가장 점수가 낮은(타겟에 가깝고 둥근) 1순위 객체를 최종 선택
+                        candidates.sort(key=lambda x: x[0])
+                        best_candidate = candidates[0][1]
+
+            if best_candidate:
+                bx, by = best_candidate
+                self.trajectory[current_frame_idx] = (bx, by)
+                self.is_object_selected = True
+                self.trajectory_modified = True
+                self.update_traj_list()
+                self.auto_save_trajectory()
+                
+                # AI가 찾은 사람과 영역을 잠시 화면에 렌더링해서 시각적 피드백 제공
+                feedback_frame = self.process_frame(frame)
+                self.display_frame(feedback_frame)
+                
+                if getattr(self, 'use_yolo', True):
+                    QMessageBox.information(self, "AI 탐지 완료", "YOLOv8 모델을 사용하여 골퍼의 발 주변에서 가장 유력한 공을 성공적으로 찾았습니다!")
+                else:
+                    QMessageBox.information(self, "탐지 완료 (대체 모드)", "OpenCV 객체 인식 모델을 사용하여 골퍼의 발 주변에서 유력한 공을 성공적으로 찾았습니다!")
+                
+                # 알림창을 닫으면 원본으로 복구
+                self.display_frame(self.process_frame(self.current_frame))
+            else:
+                self.display_frame(self.process_frame(self.current_frame))
+                if getattr(self, 'use_yolo', True):
+                    QMessageBox.warning(self, "탐지 실패", "YOLO AI 모델 및 알고리즘으로 공을 찾지 못했습니다.\n배경이 너무 밝거나 공이 작을 수 있습니다. 직접 클릭해주세요.")
+                else:
+                    QMessageBox.warning(self, "탐지 실패", "OpenCV 대체 알고리즘으로 공을 찾지 못했습니다.\n배경이 너무 밝거나 공이 작을 수 있습니다. 직접 클릭해주세요.")
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"AI 탐지 중 오류가 발생했습니다: {e}")
+        finally:
+            self.auto_find_button.setText("🔍 현재 화면에서 자동 공 찾기")
 
     def show_dashboard(self):
         import math
@@ -653,50 +910,67 @@ class GolfTrackerApp(QMainWindow):
 
     def eventFilter(self, source, event):
         # 비디오 라벨 위에서 마우스가 움직일 때 돋보기 기능 수행
-        if source == self.video_label and event.type() == QEvent.MouseMove:
-            if self.is_tracking and self.current_frame is not None:
-                pos = event.pos()
-                x, y = pos.x(), pos.y()
-                
-                pixmap = self.video_label.pixmap()
-                if pixmap is not None:
-                    pw, ph = pixmap.width(), pixmap.height()
-                    lw, lh = self.video_label.width(), self.video_label.height()
-
-                    offset_x = (lw - pw) / 2
-                    offset_y = (lh - ph) / 2
-
-                    if offset_x <= x <= offset_x + pw and offset_y <= y <= offset_y + ph:
-                        frame_h, frame_w = self.current_frame.shape[:2]
-                        click_img_x = int((x - offset_x) * (frame_w / pw))
-                        click_img_y = int((y - offset_y) * (frame_h / ph))
-                        
-                        # 돋보기로 보여줄 영역 크기 (원본 영상에서 100x100 픽셀을 잘라냄)
-                        box_size = 100
-                        x1 = max(0, click_img_x - box_size // 2)
-                        y1 = max(0, click_img_y - box_size // 2)
-                        x2 = min(frame_w, click_img_x + box_size // 2)
-                        y2 = min(frame_h, click_img_y + box_size // 2)
-                        
-                        roi = self.current_frame[y1:y2, x1:x2].copy()
-                        
-                        if roi.size > 0:
-                            # 십자선 그리기 (초록색)
-                            rh, rw = roi.shape[:2]
-                            cv2.line(roi, (rw//2, 0), (rw//2, rh), (0, 255, 0), 1)
-                            cv2.line(roi, (0, rh//2), (rw, rh//2), (0, 255, 0), 1)
-                            
-                            rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                            qt_image = QImage(rgb_roi.data, rw, rh, rw * 3, QImage.Format_RGB888)
-                            
-                            # 돋보기 창 크기(400x400)에 맞춰 강제로 확대
-                            zoom_pixmap = QPixmap.fromImage(qt_image).scaled(400, 400, Qt.KeepAspectRatio, Qt.FastTransformation)
-                            self.magnifier_label.setPixmap(zoom_pixmap)
-            else:
+        if source == self.video_label:
+            if event.type() == QEvent.MouseMove:
+                self.last_mouse_pos = event.pos()
+                self.update_magnifier()
+            elif event.type() == QEvent.Leave:
+                self.last_mouse_pos = None
                 self.magnifier_label.clear()
                 self.magnifier_label.setText("돋보기")
                             
         return super().eventFilter(source, event)
+
+    def update_magnifier(self):
+        if not hasattr(self, 'last_mouse_pos') or self.last_mouse_pos is None:
+            self.magnifier_label.clear()
+            self.magnifier_label.setText("돋보기")
+            return
+            
+        if self.is_tracking and self.current_frame is not None:
+            pos = self.last_mouse_pos
+            x, y = pos.x(), pos.y()
+            
+            pixmap = self.video_label.pixmap()
+            if pixmap is not None:
+                pw, ph = pixmap.width(), pixmap.height()
+                lw, lh = self.video_label.width(), self.video_label.height()
+
+                offset_x = (lw - pw) / 2
+                offset_y = (lh - ph) / 2
+
+                if offset_x <= x <= offset_x + pw and offset_y <= y <= offset_y + ph:
+                    frame_h, frame_w = self.current_frame.shape[:2]
+                    click_img_x = int((x - offset_x) * (frame_w / pw))
+                    click_img_y = int((y - offset_y) * (frame_h / ph))
+                    
+                    # 돋보기로 보여줄 영역 크기 (원본 영상에서 100x100 픽셀을 잘라냄)
+                    box_size = 100
+                    x1 = max(0, click_img_x - box_size // 2)
+                    y1 = max(0, click_img_y - box_size // 2)
+                    x2 = min(frame_w, click_img_x + box_size // 2)
+                    y2 = min(frame_h, click_img_y + box_size // 2)
+                    
+                    roi = self.current_frame[y1:y2, x1:x2].copy()
+                    
+                    if roi.size > 0:
+                        # 십자선 그리기 (초록색)
+                        rh, rw = roi.shape[:2]
+                        cv2.line(roi, (rw//2, 0), (rw//2, rh), (0, 255, 0), 1)
+                        cv2.line(roi, (0, rh//2), (rw, rh//2), (0, 255, 0), 1)
+                        
+                        rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                        qt_image = QImage(rgb_roi.data, rw, rh, rw * 3, QImage.Format_RGB888)
+                        
+                        # 돋보기 창 크기(400x400)에 맞춰 강제로 확대
+                        zoom_pixmap = QPixmap.fromImage(qt_image).scaled(400, 400, Qt.KeepAspectRatio, Qt.FastTransformation)
+                        self.magnifier_label.setPixmap(zoom_pixmap)
+                else:
+                    self.magnifier_label.clear()
+                    self.magnifier_label.setText("돋보기")
+        else:
+            self.magnifier_label.clear()
+            self.magnifier_label.setText("돋보기")
 
     def mousePressEvent(self, event):
         # 비디오가 로드되어 있고 분석 모드가 켜져있을 때만 마우스 클릭 처리
@@ -859,6 +1133,77 @@ class GolfTrackerApp(QMainWindow):
                             cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
                             cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
                             cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
+                        elif anim_style == 10:
+                            hsv_color = np.uint8([[[int(i * 180 / len(points_to_draw)), 255, 255]]])
+                            bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+                            color = (int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2]))
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], color, 6)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 2)
+                        elif anim_style == 11:
+                            alpha = i / len(points_to_draw)
+                            color = (int(255), int(200 * alpha), int(100 * alpha))
+                            thickness = int(2 + 6 * alpha)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], color, thickness)
+                        elif anim_style == 12:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 100, 255), 5)
+                            if i % 3 == 0:
+                                import random
+                                px, py = points_to_draw[i]
+                                ox, oy = random.randint(-10, 10), random.randint(-10, 10)
+                                cv2.circle(display_frame, (px + ox, py + oy), random.randint(2, 5), (0, 165, 255), -1)
+                        elif anim_style == 13:
+                            import random
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 0), 2)
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            mx, my = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+                            ox, oy = random.randint(-8, 8), random.randint(-8, 8)
+                            cv2.line(display_frame, p1, (mx + ox, my + oy), (255, 255, 0), 2)
+                            cv2.line(display_frame, (mx + ox, my + oy), p2, (255, 255, 0), 2)
+                        elif anim_style == 14:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (200, 0, 255), 10)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 100, 255), 5)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 2)
+                        elif anim_style == 15:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 200, 0), 2)
+                            if i % 4 == 0:
+                                px, py = points_to_draw[i]
+                                cv2.circle(display_frame, (px, py), 5, (255, 255, 0), 2)
+                                cv2.circle(display_frame, (px, py), 10, (255, 200, 0), 1)
+                        elif anim_style == 16:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 215, 255), 2)
+                            if i % 2 == 0:
+                                import random
+                                px, py = points_to_draw[i]
+                                ox, oy = random.randint(-15, 15), random.randint(-15, 15)
+                                size = random.randint(2, 6)
+                                cv2.line(display_frame, (px+ox-size, py+oy), (px+ox+size, py+oy), (0, 255, 255), 1)
+                                cv2.line(display_frame, (px+ox, py+oy-size), (px+ox, py+oy+size), (0, 255, 255), 1)
+                        elif anim_style == 17:
+                            import random
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            ox, oy = random.randint(-3, 3), random.randint(-3, 3)
+                            cv2.line(display_frame, (p1[0]+ox, p1[1]+oy), (p2[0]+ox, p2[1]+oy), (255, 0, 255), 4)
+                            cv2.line(display_frame, (p1[0]-ox, p1[1]-oy), (p2[0]-ox, p2[1]-oy), (255, 255, 0), 4)
+                            cv2.line(display_frame, p1, p2, (255, 255, 255), 2)
+                        elif anim_style == 18:
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            cv2.line(display_frame, (p1[0]-4, p1[1]-4), (p2[0]-4, p2[1]-4), (255, 100, 100), 2)
+                            cv2.line(display_frame, p1, p2, (100, 255, 100), 2)
+                            cv2.line(display_frame, (p1[0]+4, p1[1]+4), (p2[0]+4, p2[1]+4), (100, 100, 255), 2)
+                        elif anim_style == 19:
+                            import math
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            if dist > 0:
+                                ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                nx, ny = -uy, ux
+                                offset = math.sin(i * 0.5) * 8
+                                p1_a = (int(p1[0] + nx*offset), int(p1[1] + ny*offset))
+                                p2_a = (int(p2[0] + nx*offset), int(p2[1] + ny*offset))
+                                p1_b = (int(p1[0] - nx*offset), int(p1[1] - ny*offset))
+                                p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
+                                cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
+                                cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
             else:
                 try:
                     from scipy.interpolate import splprep, splev
@@ -981,6 +1326,105 @@ class GolfTrackerApp(QMainWindow):
                                         cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
                                         cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
                                         cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
+                            elif anim_style == 10:
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    hsv_color = np.uint8([[[int(j * 180 / num_pts), 255, 255]]])
+                                    bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+                                    color = (int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2]))
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    cv2.line(display_frame, p1, p2, color, 6)
+                                    cv2.line(display_frame, p1, p2, (255, 255, 255), 2)
+                            elif anim_style == 11:
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    alpha = j / num_pts
+                                    color = (int(255), int(200 * alpha), int(100 * alpha))
+                                    thickness = int(2 + 6 * alpha)
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    cv2.line(display_frame, p1, p2, color, thickness)
+                            elif anim_style == 12:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 100, 255), 5)
+                                import random
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 5 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        ox, oy = random.randint(-15, 15), random.randint(-15, 15)
+                                        cv2.circle(display_frame, (px + ox, py + oy), random.randint(2, 6), (0, 165, 255), -1)
+                                        cv2.circle(display_frame, (px + ox//2, py + oy//2), random.randint(1, 3), (0, 255, 255), -1)
+                            elif anim_style == 13:
+                                import random
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 0), 2)
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts, 3):
+                                    if j+3 < num_pts:
+                                        p1 = tuple(map(int, anim_pts[j]))
+                                        p2 = tuple(map(int, anim_pts[j+3]))
+                                        mx, my = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+                                        ox, oy = random.randint(-12, 12), random.randint(-12, 12)
+                                        cv2.line(display_frame, p1, (mx + ox, my + oy), (255, 255, 0), 2)
+                                        cv2.line(display_frame, (mx + ox, my + oy), p2, (255, 255, 0), 2)
+                            elif anim_style == 14:
+                                cv2.polylines(display_frame, [anim_curve], False, (200, 0, 255), 12)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 100, 255), 6)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                            elif anim_style == 15:
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 200, 0), 2)
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 15 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        cv2.circle(display_frame, (px, py), 5, (255, 255, 0), 2)
+                                        cv2.circle(display_frame, (px, py), 10, (255, 200, 0), 1)
+                            elif anim_style == 16:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 215, 255), 2)
+                                import random
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 6 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        ox, oy = random.randint(-15, 15), random.randint(-15, 15)
+                                        size = random.randint(2, 6)
+                                        cv2.line(display_frame, (px+ox-size, py+oy), (px+ox+size, py+oy), (0, 255, 255), 1)
+                                        cv2.line(display_frame, (px+ox, py+oy-size), (px+ox, py+oy+size), (0, 255, 255), 1)
+                            elif anim_style == 17:
+                                import random
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    ox, oy = random.randint(-3, 3), random.randint(-3, 3)
+                                    cv2.line(display_frame, (p1[0]+ox, p1[1]+oy), (p2[0]+ox, p2[1]+oy), (255, 0, 255), 4)
+                                    cv2.line(display_frame, (p1[0]-ox, p1[1]-oy), (p2[0]-ox, p2[1]-oy), (255, 255, 0), 4)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                            elif anim_style == 18:
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    cv2.line(display_frame, (p1[0]-4, p1[1]-4), (p2[0]-4, p2[1]-4), (255, 100, 100), 2)
+                                    cv2.line(display_frame, (p1[0]+4, p1[1]+4), (p2[0]+4, p2[1]+4), (100, 100, 255), 2)
+                                cv2.polylines(display_frame, [anim_curve], False, (100, 255, 100), 2)
+                            elif anim_style == 19:
+                                import math
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                    if dist > 0:
+                                        ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                        nx, ny = -uy, ux
+                                        offset = math.sin(j * 0.2) * 8
+                                        p1_a = (int(p1[0] + nx*offset), int(p1[1] + ny*offset))
+                                        p2_a = (int(p2[0] + nx*offset), int(p2[1] + ny*offset))
+                                        p1_b = (int(p1[0] - nx*offset), int(p1[1] - ny*offset))
+                                        p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
+                                        cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
+                                        cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
                             
                 except Exception as e:
                     print(f"Curve fitting error: {e}")
@@ -1033,6 +1477,77 @@ class GolfTrackerApp(QMainWindow):
                                 cv2.circle(display_frame, (cx - s, cy + s), s, (0, 200, 0), -1)
                                 cv2.circle(display_frame, (cx + s, cy + s), s, (0, 200, 0), -1)
                                 cv2.line(display_frame, (cx, cy), (cx, cy + s * 3), (0, 200, 0), 1)
+                            elif anim_style == 10:
+                                hsv_color = np.uint8([[[int(i * 180 / len(points_to_draw)), 255, 255]]])
+                                bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+                                color = (int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2]))
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], color, 6)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 2)
+                            elif anim_style == 11:
+                                alpha = i / len(points_to_draw)
+                                color = (int(255), int(200 * alpha), int(100 * alpha))
+                                thickness = int(2 + 6 * alpha)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], color, thickness)
+                            elif anim_style == 12:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 100, 255), 5)
+                                if i % 3 == 0:
+                                    import random
+                                    px, py = points_to_draw[i]
+                                    ox, oy = random.randint(-10, 10), random.randint(-10, 10)
+                                    cv2.circle(display_frame, (px + ox, py + oy), random.randint(2, 5), (0, 165, 255), -1)
+                            elif anim_style == 13:
+                                import random
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 0), 2)
+                                p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                                mx, my = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+                                ox, oy = random.randint(-8, 8), random.randint(-8, 8)
+                                cv2.line(display_frame, p1, (mx + ox, my + oy), (255, 255, 0), 2)
+                                cv2.line(display_frame, (mx + ox, my + oy), p2, (255, 255, 0), 2)
+                            elif anim_style == 14:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (200, 0, 255), 10)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 100, 255), 5)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 2)
+                            elif anim_style == 15:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 200, 0), 2)
+                                if i % 4 == 0:
+                                    px, py = points_to_draw[i]
+                                    cv2.circle(display_frame, (px, py), 5, (255, 255, 0), 2)
+                                    cv2.circle(display_frame, (px, py), 10, (255, 200, 0), 1)
+                            elif anim_style == 16:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 215, 255), 2)
+                                if i % 2 == 0:
+                                    import random
+                                    px, py = points_to_draw[i]
+                                    ox, oy = random.randint(-15, 15), random.randint(-15, 15)
+                                    size = random.randint(2, 6)
+                                    cv2.line(display_frame, (px+ox-size, py+oy), (px+ox+size, py+oy), (0, 255, 255), 1)
+                                    cv2.line(display_frame, (px+ox, py+oy-size), (px+ox, py+oy+size), (0, 255, 255), 1)
+                            elif anim_style == 17:
+                                import random
+                                p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                                ox, oy = random.randint(-3, 3), random.randint(-3, 3)
+                                cv2.line(display_frame, (p1[0]+ox, p1[1]+oy), (p2[0]+ox, p2[1]+oy), (255, 0, 255), 4)
+                                cv2.line(display_frame, (p1[0]-ox, p1[1]-oy), (p2[0]-ox, p2[1]-oy), (255, 255, 0), 4)
+                                cv2.line(display_frame, p1, p2, (255, 255, 255), 2)
+                            elif anim_style == 18:
+                                p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                                cv2.line(display_frame, (p1[0]-4, p1[1]-4), (p2[0]-4, p2[1]-4), (255, 100, 100), 2)
+                                cv2.line(display_frame, p1, p2, (100, 255, 100), 2)
+                                cv2.line(display_frame, (p1[0]+4, p1[1]+4), (p2[0]+4, p2[1]+4), (100, 100, 255), 2)
+                            elif anim_style == 19:
+                                import math
+                                p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                                dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                if dist > 0:
+                                    ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                    nx, ny = -uy, ux
+                                    offset = math.sin(i * 0.5) * 8
+                                    p1_a = (int(p1[0] + nx*offset), int(p1[1] + ny*offset))
+                                    p2_a = (int(p2[0] + nx*offset), int(p2[1] + ny*offset))
+                                    p1_b = (int(p1[0] - nx*offset), int(p1[1] - ny*offset))
+                                    p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
+                                    cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
+                                    cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
 
         # 3. 다음 프레임 위치 예측 (현재까지의 궤적을 기반으로)
         if self.is_tracking and not export_mode:
@@ -1363,6 +1878,8 @@ class GolfTrackerApp(QMainWindow):
         pixmap = QPixmap.fromImage(qt_image)
         scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.video_label.setPixmap(scaled_pixmap)
+        
+        self.update_magnifier()
 
 def main():
     app = QApplication(sys.argv)

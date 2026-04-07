@@ -104,6 +104,19 @@ class GolfTrackerApp(QMainWindow):
         self.save_traj_button.setEnabled(False)
         self.load_traj_button = QPushButton("궤적 가져오기")
         self.load_traj_button.setEnabled(False)
+        
+        # 스윙 데이터 대시보드 버튼
+        self.dashboard_button = QPushButton("스윙 데이터 대시보드 📊")
+        self.dashboard_button.setEnabled(False)
+        self.dashboard_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        
+        # 캘리브레이션 버튼
+        self.calibrate_button = QPushButton("📏 영점 조절 (공 크기 기준)")
+        # 캘리브레이션(영점 조절) 버튼들
+        self.auto_calibrate_button = QPushButton("🤖 자동 영점 조절")
+        self.auto_calibrate_button.setEnabled(False)
+        self.calibrate_button = QPushButton("📏 수동 조절")
+        self.calibrate_button.setEnabled(False)
 
         # 돋보기 영역 (Magnifier)
         self.magnifier_label = QLabel("돋보기")
@@ -130,6 +143,12 @@ class GolfTrackerApp(QMainWindow):
         self.control_layout.addWidget(self.anim_style_combo)
         self.control_layout.addWidget(self.save_traj_button)
         self.control_layout.addWidget(self.load_traj_button)
+        self.control_layout.addWidget(self.dashboard_button)
+        self.control_layout.addWidget(self.calibrate_button)
+        calib_layout = QHBoxLayout()
+        calib_layout.addWidget(self.auto_calibrate_button)
+        calib_layout.addWidget(self.calibrate_button)
+        self.control_layout.addLayout(calib_layout)
 
         # 궤적 목록 리스트 추가
         self.traj_list = QListWidget()
@@ -172,6 +191,11 @@ class GolfTrackerApp(QMainWindow):
         self.trajectory = {}       # 프레임 인덱스를 키로 가지는 궤적 좌표 딕셔너리
         self.trajectory_modified = False  # 궤적 수정 여부 플래그
         
+        # 영점 조절(캘리브레이션) 변수
+        self.is_calibrating = False
+        self.calibration_points = []
+        self.meters_per_pixel = 0.012  # 기본값 (1픽셀당 1.2cm)
+
         # 자르기 구간 변수
         self.trim_start_frame = 0
         self.trim_end_frame = -1
@@ -184,6 +208,9 @@ class GolfTrackerApp(QMainWindow):
         self.anim_style_combo.currentIndexChanged.connect(self.redraw_current_frame)
         self.save_traj_button.clicked.connect(self.export_trajectory)
         self.load_traj_button.clicked.connect(self.import_trajectory)
+        self.dashboard_button.clicked.connect(self.show_dashboard)
+        self.auto_calibrate_button.clicked.connect(self.auto_calibrate)
+        self.calibrate_button.clicked.connect(self.start_calibration)
         self.traj_list.itemClicked.connect(self.on_traj_item_clicked)
         self.delete_traj_button.clicked.connect(self.delete_selected_trajectory)
         self.trim_start_button.clicked.connect(self.set_trim_start)
@@ -306,6 +333,9 @@ class GolfTrackerApp(QMainWindow):
                 self.timeline_slider.setEnabled(True)
                 self.save_traj_button.setEnabled(True)
                 self.load_traj_button.setEnabled(True)
+                self.dashboard_button.setEnabled(True)
+                self.auto_calibrate_button.setEnabled(True)
+                self.calibrate_button.setEnabled(True)
                 self.delete_traj_button.setEnabled(True)
 
                 self.trim_start_button.setEnabled(True)
@@ -436,6 +466,191 @@ class GolfTrackerApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "오류", f"로드 실패: {e}")
 
+    def auto_calibrate(self):
+        import math
+        if not self.trajectory:
+            QMessageBox.warning(self, "경고", "먼저 화면에서 공을 클릭해 궤적을 1개 이상 입력해주세요.")
+            return
+
+        first_frame_idx = min(self.trajectory.keys())
+        bx, by = self.trajectory[first_frame_idx]
+
+        # 해당 프레임 읽어오기
+        current_pos = self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)
+        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, first_frame_idx)
+        ret, frame = self.video_capture.read()
+        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, current_pos) # 원래 위치 복구
+
+        if not ret:
+            QMessageBox.warning(self, "오류", "해당 프레임을 읽을 수 없습니다.")
+            return
+
+        # 공 주변 40x40 픽셀 영역 잘라내기
+        box_size = 40
+        h, w = frame.shape[:2]
+        x1 = max(0, bx - box_size // 2)
+        y1 = max(0, by - box_size // 2)
+        x2 = min(w, bx + box_size // 2)
+        y2 = min(h, by + box_size // 2)
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # 1차 시도: Hough 원 변환(HoughCircles) 알고리즘으로 동그란 형태 탐지
+        circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1.2, minDist=10,
+                                   param1=50, param2=15, minRadius=2, maxRadius=15)
+        
+        best_radius = 0
+        cx_roi, cy_roi = bx - x1, by - y1
+
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype("int")
+            min_dist = float('inf')
+            for (x, y, r) in circles:
+                dist = math.hypot(x - cx_roi, y - cy_roi)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_radius = r
+            # 클릭한 곳과 중심이 너무 멀면 오인식으로 간주
+            if min_dist > 10:
+                best_radius = 0
+
+        # 2차 시도: 원 변환 실패 시 밝기 기준 외곽선(Contours) 검출
+        if best_radius == 0:
+            _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            min_dist = float('inf')
+            for cnt in contours:
+                (x, y), radius = cv2.minEnclosingCircle(cnt)
+                dist = math.hypot(x - cx_roi, y - cy_roi)
+                if dist < 15 and 1 < radius < 20:
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_radius = radius
+
+        if best_radius > 0:
+            dist_px = best_radius * 2
+            self.meters_per_pixel = 0.04267 / dist_px
+            QMessageBox.information(self, "자동 영점 조절 완료", 
+                                    f"궤적 시작점의 골프공 크기를 자동으로 인식했습니다!\n\n"
+                                    f"인식된 직경: {dist_px:.1f} 픽셀\n"
+                                    f"1픽셀당 비율: {self.meters_per_pixel*100:.2f} cm")
+        else:
+            QMessageBox.warning(self, "자동 인식 실패", 
+                                "골프공을 명확히 찾지 못했습니다.\n"
+                                "배경과 공의 색상이 비슷하거나 크기가 너무 작을 수 있습니다.\n"
+                                "'수동 조절' 버튼을 이용해주세요.")
+
+    def start_calibration(self):
+        self.is_calibrating = True
+        self.calibration_points = []
+        QMessageBox.information(self, "영점 조절 시작", "영상(또는 돋보기)에 보이는 골프공의 지름을 측정합니다.\n\n공의 왼쪽 끝과 오른쪽 끝을 각각 마우스로 1번씩(총 2번) 클릭해주세요.")
+        self.setFocus()
+
+    def show_dashboard(self):
+        import math
+        if len(self.trajectory) < 3:
+            QMessageBox.warning(self, "데이터 부족", "정확한 분석을 위해 최소 3개 이상의 궤적 점이 필요합니다.")
+            return
+
+        fps = 30
+        if self.video_capture is not None and self.video_capture.isOpened():
+            fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+            if fps == 0: fps = 30
+
+        frames = sorted(self.trajectory.keys())
+        points = [self.trajectory[f] for f in frames]
+
+        # 1. 발사각 (Launch Angle)
+        p0 = points[0]
+        # 노이즈를 줄이기 위해 시작점에서 3프레임 또는 1/10 지점의 좌표 사용
+        idx_launch = min(3, max(1, len(points) // 10))
+        p_launch = points[idx_launch]
+        
+        dx = p_launch[0] - p0[0]
+        dy = p0[1] - p_launch[1] # 화면 Y는 아래로 갈수록 커지므로 반전
+
+        # 지면 대비 절대 발사각 (진행 방향에 상관없이 위로 향하는 각도)
+        launch_angle = math.degrees(math.atan2(dy, abs(dx))) if dx != 0 else (90.0 if dy > 0 else -90.0)
+        direction = "우측" if dx > 0 else "좌측" if dx < 0 else "수직"
+
+        # 속도 추정 (Ball Speed & Swing Speed)
+        dist_px = math.hypot(dx, dy)
+        time_elapsed = (frames[idx_launch] - frames[0]) / fps
+        
+        # 캘리브레이션된 픽셀 당 미터 값 사용 (기본값 0.012)
+        meters_per_pixel = getattr(self, 'meters_per_pixel', 0.012)
+        
+        if time_elapsed > 0:
+            # 2D 카메라(특히 타겟 방향을 바라보는 후방 DTL 구도)에서는 공이 화면 안쪽(Z축)으로 날아갑니다.
+            # 화면상의 X, Y 픽셀 이동량만 계산하면 실제 이동 거리의 1/5 수준으로 측정되므로 3D 원근 보정 계수를 곱해줍니다.
+            perspective_compensation = 5.5
+            ball_speed_mps = ((dist_px * meters_per_pixel) / time_elapsed) * perspective_compensation
+            
+            # 스매시 팩터(Smash Factor) 1.45를 가정하여 클럽 헤드 스피드 역산
+            swing_speed_mps = ball_speed_mps / 1.45
+        else:
+            ball_speed_mps = 0.0
+            swing_speed_mps = 0.0
+
+        # 2. 최고점 (Apex) 및 체공 시간
+        y_coords = [p[1] for p in points]
+        apex_idx = y_coords.index(min(y_coords))
+        apex_frame = frames[apex_idx]
+        apex_time = (apex_frame - frames[0]) / fps
+        hang_time = (frames[-1] - frames[0]) / fps
+
+        # 3. 구질 분석 (Shot Shape)
+        p_end = points[-1]
+        v1_x = p_end[0] - p0[0]
+        v1_y = p_end[1] - p0[1]
+        v1_len = math.hypot(v1_x, v1_y)
+        
+        avg_deviation = 0
+        if v1_len > 0:
+            curve_sum = 0
+            for p in points:
+                v2_x = p[0] - p0[0]
+                v2_y = p[1] - p0[1]
+                # 외적(Cross Product)으로 치우침 거리 계산
+                cross = v1_x * v2_y - v1_y * v2_x
+                curve_sum += cross
+            
+            # 평균 치우침 픽셀 거리
+            avg_deviation = curve_sum / (v1_len * len(points))
+
+        # 영상 촬영 구도(정면 vs 후방) 자동 판별
+        # 공이 가로(X)로 이동한 거리가 세로(Y) 이동 거리보다 확연히 크면 정면(Face-On) 영상으로 간주
+        if abs(v1_x) > abs(v1_y) * 1.2:
+            shot_shape = "분석 불가 (정면/측면 구도 영상)"
+        else:
+            # 후방(DTL) 영상 기준 해석 (마우스 클릭 오차를 감안해 임계값을 10픽셀로 둔감화)
+            if avg_deviation > 10:
+                shot_shape = "화면 우측 휨 (페이드/슬라이스 추정)"
+            elif avg_deviation < -10:
+                shot_shape = "화면 좌측 휨 (드로우/훅 추정)"
+            else:
+                shot_shape = "스트레이트 (직진 추정)"
+
+        report = (
+            f"📊 [스윙 데이터 추정 대시보드]\n\n"
+            f"🎯 타구 방향: 화면 {direction}\n"
+            f"📐 초기 발사각: {launch_angle:.1f}°\n"
+            f"🚀 추정 볼 스피드: 약 {ball_speed_mps:.1f} m/s\n"
+            f"🏌️ 추정 스윙 스피드: 약 {swing_speed_mps:.1f} m/s\n"
+            f"⏱️ 최고점 도달: {apex_time:.2f}초 (프레임 {apex_frame})\n"
+            f"⏳ 총 체공 시간: {hang_time:.2f}초\n"
+            f"🌪️ 비행 궤적: {shot_shape}\n\n"
+            f"*위 데이터는 2D 화면상의 픽셀 좌표를 기반으로 계산된\n"
+            f"추정치이므로 실제 수치(센서 측정값)와는 다를 수 있습니다."
+        )
+
+        QMessageBox.information(self, "스윙 데이터 대시보드", report)
+
     def eventFilter(self, source, event):
         # 비디오 라벨 위에서 마우스가 움직일 때 돋보기 기능 수행
         if source == self.video_label and event.type() == QEvent.MouseMove:
@@ -522,6 +737,25 @@ class GolfTrackerApp(QMainWindow):
             if current_frame_idx < 0:
                 current_frame_idx = 0
 
+            # 캘리브레이션(영점 조절) 모드일 경우
+            if getattr(self, 'is_calibrating', False):
+                import math
+                self.calibration_points.append((click_img_x, click_img_y))
+                if len(self.calibration_points) == 2:
+                    p1 = self.calibration_points[0]
+                    p2 = self.calibration_points[1]
+                    dist_px = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                    if dist_px > 0:
+                        # 실제 골프공 지름은 약 4.267cm (0.04267m)
+                        self.meters_per_pixel = 0.04267 / dist_px
+                        QMessageBox.information(self, "영점 조절 완료", f"골프공 지름이 {dist_px:.1f} 픽셀로 측정되었습니다.\n\n이제 1픽셀당 {self.meters_per_pixel*100:.2f}cm 의 비율을 바탕으로 더 정확한 스피드가 계산됩니다!")
+                    else:
+                        QMessageBox.warning(self, "오류", "서로 다른 두 점을 클릭해주세요.")
+                    self.is_calibrating = False
+                    self.calibration_points = []
+                self.display_frame(self.process_frame(self.current_frame))
+                return
+
             # 사용자가 클릭한 정확한 좌표를 딕셔너리에 저장 (돋보기를 믿고 자동 보정 제거)
             self.trajectory[current_frame_idx] = (click_img_x, click_img_y)
             self.is_object_selected = True
@@ -560,6 +794,13 @@ class GolfTrackerApp(QMainWindow):
                 # 아직 좌표가 없을 때의 안내 문구
                 cv2.putText(display_frame, "Click on the ball to set position!", (50, 50), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        # 캘리브레이션 진행 중일 때 클릭한 첫 번째 점 시각적 표시
+        if getattr(self, 'is_calibrating', False) and getattr(self, 'calibration_points', []) and not export_mode:
+            pt = self.calibration_points[0]
+            cv2.circle(display_frame, pt, 4, (0, 255, 255), -1)
+            cv2.putText(display_frame, "Click the other side of the ball", (pt[0] + 15, pt[1]), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
         # 2. 궤적 그리기 (체크박스 옵션에 따라 선 연결)
         if (is_show_all or is_anim_mode) and self.trajectory:
@@ -1088,6 +1329,14 @@ class GolfTrackerApp(QMainWindow):
                     self.toggle_playback()
                 self.next_frame()
             elif event.key() == Qt.Key_Escape:
+                if getattr(self, 'is_calibrating', False):
+                    self.is_calibrating = False
+                    self.calibration_points = []
+                    QMessageBox.information(self, "취소", "영점 조절 모드가 취소되었습니다.")
+                    if self.current_frame is not None:
+                        self.display_frame(self.process_frame(self.current_frame))
+                    return
+
                 current_frame_idx = int(self.video_capture.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                 if current_frame_idx < 0:
                     current_frame_idx = 0

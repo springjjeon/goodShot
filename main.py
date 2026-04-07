@@ -10,6 +10,116 @@ except ImportError:
 import cv2
 import numpy as np
 import json
+import av
+
+class AVVideoCapture:
+    """cv2.VideoCapture 인터페이스를 모방하지만, PyAV(FFmpeg)를 사용하여
+    HDR 10-bit 등 최신 영상 포맷의 원본 색감(BT.709/BT.2020)을 
+    OpenCV 특유의 물빠짐 현상 없이 정확히 가져오는 래퍼 클래스입니다."""
+    
+    def __init__(self, filename):
+        self.filename = filename
+        try:
+            self.container = av.open(filename)
+            self.stream = self.container.streams.video[0]
+            self.stream.thread_type = "AUTO"
+            self._is_opened = True
+            
+            self.fps = float(self.stream.average_rate)
+            if self.fps == 0: self.fps = 30.0
+            
+            self.frame_count = self.stream.frames
+            if self.frame_count == 0 and self.stream.duration is not None and self.stream.time_base is not None:
+                self.frame_count = int(float(self.stream.duration * self.stream.time_base) * self.fps)
+                
+            self.width = self.stream.width
+            self.height = self.stream.height
+            
+            self.current_frame_idx = 0
+            self.iterator = self.container.decode(video=0)
+        except Exception as e:
+            print(f"AVVideoCapture Error: {e}")
+            self._is_opened = False
+            
+    def isOpened(self):
+        return getattr(self, '_is_opened', False)
+        
+    def read(self):
+        if not self._is_opened:
+            return False, None
+            
+        try:
+            frame = next(self.iterator)
+            self.current_frame_idx += 1
+            # bgr24 포맷으로 가져오면 cv2 형식과 완벽 호환되며, FFmpeg가 올바른 색공간 매핑을 수행함
+            img = frame.to_ndarray(format='bgr24')
+            return True, img
+        except Exception:
+            return False, None
+            
+    def get(self, propId):
+        if propId == cv2.CAP_PROP_FPS:
+            return self.fps
+        elif propId == cv2.CAP_PROP_FRAME_COUNT:
+            return self.frame_count
+        elif propId == cv2.CAP_PROP_POS_FRAMES:
+            return self.current_frame_idx
+        elif propId == cv2.CAP_PROP_FRAME_WIDTH:
+            return self.width
+        elif propId == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self.height
+        return 0
+        
+    def set(self, propId, value):
+        if propId == cv2.CAP_PROP_POS_FRAMES:
+            target_frame = int(value)
+            if target_frame == self.current_frame_idx:
+                return True
+                
+            try:
+                # PTS 계산 시, duration과 frames의 비율을 사용하면 가장 정확함
+                if self.stream.frames > 0 and self.stream.duration is not None:
+                    pts = int(target_frame * self.stream.duration / self.stream.frames)
+                elif self.stream.time_base is not None:
+                    time_sec = target_frame / self.fps
+                    pts = int(time_sec / float(self.stream.time_base))
+                else:
+                    pts = target_frame
+                    
+                self.container.seek(pts, stream=self.stream, backward=True, any_frame=False)
+                self.iterator = self.container.decode(video=0)
+                
+                # 시크 위치 이후부터 정확한 목표 프레임까지 순차 디코드
+                # 무한루프 방지 안전장치 60프레임
+                skip_count = 0
+                for frame in self.iterator:
+                    if frame.pts is None: continue
+                    if self.stream.duration is not None and self.stream.frames > 0:
+                        frame_idx = int(frame.pts * self.stream.frames / self.stream.duration)
+                    elif self.stream.time_base is not None:
+                        frame_idx = int(float(frame.pts * self.stream.time_base) * self.fps + 0.5)
+                    else:
+                        frame_idx = frame.pts
+                        
+                    if frame_idx >= target_frame or skip_count >= 60:
+                        import itertools
+                        self.iterator = itertools.chain([frame], self.iterator)
+                        self.current_frame_idx = target_frame
+                        return True
+                    skip_count += 1
+                        
+                self.current_frame_idx = target_frame
+                return True
+            except Exception as e:
+                print(f"Seek error: {e}")
+                return False
+        return False
+        
+    def release(self):
+        if hasattr(self, 'container'):
+            self.container.close()
+        self._is_opened = False
+
 from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton, QHBoxLayout, QFileDialog, QSizePolicy, QCheckBox, QSlider, QStyle, QMessageBox, QListWidget, QListWidgetItem, QComboBox
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QEvent
@@ -26,7 +136,7 @@ class GolfTrackerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Good Shot - Golf Ball Tracker')
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 1600, 900)
 
         # Main widget and layout
         self.central_widget = QWidget()
@@ -112,7 +222,13 @@ class GolfTrackerApp(QMainWindow):
             "별가루 (Stardust)",
             "디지털 글리치 (Digital Glitch)",
             "오로라 (Aurora)",
-            "트윈 드래곤 (Twin Dragon)"
+            "트윈 드래곤 (Twin Dragon)",
+            "다크매터 (Dark Matter)",
+            "메테오 (Meteor Strike)",
+            "네온 매트릭스 (Neon Matrix)",
+            "매직 룬 (Magic Rune)",
+            "사이버 트론 (Cyber Tron)",
+            "스피드 포스 (Speed Force)"
         ])
         self.anim_style_combo.setEnabled(False)
 
@@ -331,12 +447,18 @@ class GolfTrackerApp(QMainWindow):
             file_path, _ = QFileDialog.getOpenFileName(None, "비디오 열기", "", "Video Files (*.mp4 *.avi *.mov)", options=QFileDialog.DontUseNativeDialog)
             if file_path:
                 self.video_path = file_path
-            self.video_capture = cv2.VideoCapture(file_path)
-            if not self.video_capture.isOpened():
-                self.video_label.setText("비디오를 여는 데 실패했습니다.")
-                return
-            
-            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                
+                # 모바일(iPhone 등)에서 촬영된 영상의 화면 회전(Rotation) 메타데이터를
+                # 정확하게 반영하여 세로/가로를 제대로 띄우기 위해 FFmpeg 백엔드를 최우선으로 사용합니다.
+                self.video_capture = cv2.VideoCapture(file_path, cv2.CAP_FFMPEG)
+                if not self.video_capture.isOpened():
+                    self.video_capture = cv2.VideoCapture(file_path)
+                
+                if not self.video_capture.isOpened():
+                    self.video_label.setText("비디오를 여는 데 실패했습니다.")
+                    return
+                
+                self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
             ret, frame = self.video_capture.read()
             if ret:
                 self.current_frame = frame.copy()
@@ -954,13 +1076,19 @@ class GolfTrackerApp(QMainWindow):
                     roi = self.current_frame[y1:y2, x1:x2].copy()
                     
                     if roi.size > 0:
-                        # 십자선 그리기 (초록색)
-                        rh, rw = roi.shape[:2]
-                        cv2.line(roi, (rw//2, 0), (rw//2, rh), (0, 255, 0), 1)
-                        cv2.line(roi, (0, rh//2), (rw, rh//2), (0, 255, 0), 1)
+                        # 돋보기 영역도 색감을 보정합니다
+                        enhanced_roi = self.enhance_color(roi)
                         
-                        rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                        qt_image = QImage(rgb_roi.data, rw, rh, rw * 3, QImage.Format_RGB888)
+                        # 십자선 그리기 (초록색)
+                        rh, rw = enhanced_roi.shape[:2]
+                        cv2.line(enhanced_roi, (rw//2, 0), (rw//2, rh), (0, 255, 0), 1)
+                        cv2.line(enhanced_roi, (0, rh//2), (rw, rh//2), (0, 255, 0), 1)
+                        
+                        rgb_roi = cv2.cvtColor(enhanced_roi, cv2.COLOR_BGR2RGB)
+                        
+                        image_data = rgb_roi.copy()
+                        qt_image = QImage(image_data.data, rw, rh, rw * 3, QImage.Format_RGB888)
+                        qt_image.ndarray = image_data # 참조 유지
                         
                         # 돋보기 창 크기(400x400)에 맞춰 강제로 확대
                         zoom_pixmap = QPixmap.fromImage(qt_image).scaled(400, 400, Qt.KeepAspectRatio, Qt.FastTransformation)
@@ -1204,6 +1332,67 @@ class GolfTrackerApp(QMainWindow):
                                 p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
                                 cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
                                 cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
+                        elif anim_style == 20:
+                            import random
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (100, 0, 150), 6)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (50, 0, 50), 2)
+                            if i % 3 == 0:
+                                px, py = points_to_draw[i]
+                                cv2.circle(display_frame, (px, py), random.randint(4, 12), (50, 0, 80), 1)
+                        elif anim_style == 21:
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 165, 255), 15)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 200, 255), 8)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 3)
+                        elif anim_style == 22:
+                            import random
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 255, 0), 2)
+                            if i % 2 == 0:
+                                px, py = points_to_draw[i]
+                                drop_len = random.randint(5, 20)
+                                cv2.line(display_frame, (px, py), (px, py + drop_len), (0, 200, 0), 1)
+                        elif anim_style == 23:
+                            import math
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 0), 2)
+                            if i % 5 == 0:
+                                px, py = points_to_draw[i]
+                                for angle in range(0, 360, 45):
+                                    rad = math.radians(angle)
+                                    ex, ey = int(px + math.cos(rad)*15), int(py + math.sin(rad)*15)
+                                    cv2.circle(display_frame, (ex, ey), 2, (255, 200, 0), -1)
+                                cv2.circle(display_frame, (px, py), 15, (255, 255, 0), 1)
+                        elif anim_style == 24:
+                            import math
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            if dist > 0:
+                                ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                nx, ny = -uy, ux
+                                left = (int(p2[0] + nx*10), int(p2[1] + ny*10))
+                                right = (int(p2[0] - nx*10), int(p2[1] - ny*10))
+                                p2_int = (int(p2[0]+ux*10), int(p2[1]+uy*10))
+                                cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (255, 255, 0), 2)
+                                cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (0, 255, 255), 1)
+                        elif anim_style == 25:
+                            # 스피드 포스 (Speed Force)
+                            import random
+                            import math
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 150, 255), 5)
+                            cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 2)
+                            
+                            p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                            dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            if dist > 0:
+                                ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                nx, ny = -uy, ux
+                                
+                                for _ in range(2):
+                                    ox = random.randint(5, 20)
+                                    side = random.choice([-1, 1])
+                                    start_x = int(p1[0] + nx*ox*side)
+                                    start_y = int(p1[1] + ny*ox*side)
+                                    end_x = int(p2[0] + nx*ox*side - ux*random.randint(0, 10))
+                                    end_y = int(p2[1] + ny*ox*side - uy*random.randint(0, 10))
+                                    cv2.line(display_frame, (start_x, start_y), (end_x, end_y), (0, 200, 255), 1)
             else:
                 try:
                     from scipy.interpolate import splprep, splev
@@ -1425,6 +1614,77 @@ class GolfTrackerApp(QMainWindow):
                                         p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
                                         cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
                                         cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
+                            elif anim_style == 20:
+                                cv2.polylines(display_frame, [anim_curve], False, (100, 0, 150), 6)
+                                cv2.polylines(display_frame, [anim_curve], False, (50, 0, 50), 2)
+                                import random
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 10 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        cv2.circle(display_frame, (px, py), random.randint(4, 12), (50, 0, 80), 1)
+                            elif anim_style == 21:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 165, 255), 15)
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 200, 255), 8)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 3)
+                            elif anim_style == 22:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 255, 0), 2)
+                                import random
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 5 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        drop_len = random.randint(5, 20)
+                                        cv2.line(display_frame, (px, py), (px, py + drop_len), (0, 200, 0), 1)
+                            elif anim_style == 23:
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 0), 2)
+                                import math
+                                num_pts = len(anim_pts)
+                                for j in range(num_pts):
+                                    if j % 15 == 0:
+                                        px, py = int(anim_pts[j][0]), int(anim_pts[j][1])
+                                        for angle in range(0, 360, 45):
+                                            rad = math.radians(angle)
+                                            ex, ey = int(px + math.cos(rad)*15), int(py + math.sin(rad)*15)
+                                            cv2.circle(display_frame, (ex, ey), 2, (255, 200, 0), -1)
+                                        cv2.circle(display_frame, (px, py), 15, (255, 255, 0), 1)
+                            elif anim_style == 24:
+                                import math
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                    if dist > 0:
+                                        ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                        nx, ny = -uy, ux
+                                        left = (int(p2[0] + nx*10), int(p2[1] + ny*10))
+                                        right = (int(p2[0] - nx*10), int(p2[1] - ny*10))
+                                        p2_int = (int(p2[0]+ux*10), int(p2[1]+uy*10))
+                                        cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (255, 255, 0), 2)
+                                        cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (0, 255, 255), 1)
+                            elif anim_style == 25:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 150, 255), 5)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                                import random
+                                import math
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    if j % 3 == 0:
+                                        dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                        if dist > 0:
+                                            ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                            nx, ny = -uy, ux
+                                            for _ in range(2):
+                                                ox = random.randint(5, 20)
+                                                side = random.choice([-1, 1])
+                                                start_x = int(p1[0] + nx*ox*side)
+                                                start_y = int(p1[1] + ny*ox*side)
+                                                end_x = int(p2[0] + nx*ox*side - ux*random.randint(0, 10))
+                                                end_y = int(p2[1] + ny*ox*side - uy*random.randint(0, 10))
+                                                cv2.line(display_frame, (start_x, start_y), (end_x, end_y), (0, 200, 255), 1)
                             
                 except Exception as e:
                     print(f"Curve fitting error: {e}")
@@ -1548,6 +1808,68 @@ class GolfTrackerApp(QMainWindow):
                                     p2_b = (int(p2[0] - nx*offset), int(p2[1] - ny*offset))
                                     cv2.line(display_frame, p1_a, p2_a, (0, 0, 255), 3)
                                     cv2.line(display_frame, p1_b, p2_b, (255, 150, 0), 3)
+                            elif anim_style == 20:
+                                import random
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (100, 0, 150), 6)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (50, 0, 50), 2)
+                                if i % 3 == 0:
+                                    px, py = points_to_draw[i]
+                                    cv2.circle(display_frame, (px, py), random.randint(4, 12), (50, 0, 80), 1)
+                            elif anim_style == 21:
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 165, 255), 15)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 200, 255), 8)
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 255), 3)
+                            elif anim_style == 22:
+                                import random
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (0, 255, 0), 2)
+                                if i % 2 == 0:
+                                    px, py = points_to_draw[i]
+                                    drop_len = random.randint(5, 20)
+                                    cv2.line(display_frame, (px, py), (px, py + drop_len), (0, 200, 0), 1)
+                            elif anim_style == 23:
+                                import math
+                                cv2.line(display_frame, points_to_draw[i-1], points_to_draw[i], (255, 255, 0), 2)
+                                if i % 5 == 0:
+                                    px, py = points_to_draw[i]
+                                    for angle in range(0, 360, 45):
+                                        rad = math.radians(angle)
+                                        ex, ey = int(px + math.cos(rad)*15), int(py + math.sin(rad)*15)
+                                        cv2.circle(display_frame, (ex, ey), 2, (255, 200, 0), -1)
+                                    cv2.circle(display_frame, (px, py), 15, (255, 255, 0), 1)
+                            elif anim_style == 24:
+                                import math
+                                p1, p2 = points_to_draw[i-1], points_to_draw[i]
+                                dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                if dist > 0:
+                                    ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                    nx, ny = -uy, ux
+                                    left = (int(p2[0] + nx*10), int(p2[1] + ny*10))
+                                    right = (int(p2[0] - nx*10), int(p2[1] - ny*10))
+                                    p2_int = (int(p2[0]+ux*10), int(p2[1]+uy*10))
+                                    cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (255, 255, 0), 2)
+                                    cv2.polylines(display_frame, [np.array([left, right, p2_int], dtype=np.int32)], True, (0, 255, 255), 1)
+                            elif anim_style == 25:
+                                cv2.polylines(display_frame, [anim_curve], False, (0, 150, 255), 5)
+                                cv2.polylines(display_frame, [anim_curve], False, (255, 255, 255), 2)
+                                import random
+                                import math
+                                num_pts = len(anim_pts)
+                                for j in range(1, num_pts):
+                                    p1 = tuple(map(int, anim_pts[j-1]))
+                                    p2 = tuple(map(int, anim_pts[j]))
+                                    if j % 3 == 0:
+                                        dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                                        if dist > 0:
+                                            ux, uy = (p2[0]-p1[0])/dist, (p2[1]-p1[1])/dist
+                                            nx, ny = -uy, ux
+                                            for _ in range(2):
+                                                ox = random.randint(5, 20)
+                                                side = random.choice([-1, 1])
+                                                start_x = int(p1[0] + nx*ox*side)
+                                                start_y = int(p1[1] + ny*ox*side)
+                                                end_x = int(p2[0] + nx*ox*side - ux*random.randint(0, 10))
+                                                end_y = int(p2[1] + ny*ox*side - uy*random.randint(0, 10))
+                                                cv2.line(display_frame, (start_x, start_y), (end_x, end_y), (0, 200, 255), 1)
 
         # 3. 다음 프레임 위치 예측 (현재까지의 궤적을 기반으로)
         if self.is_tracking and not export_mode:
@@ -1662,11 +1984,16 @@ class GolfTrackerApp(QMainWindow):
             # OpenCV는 경로에 한글이 포함된 경우 저장이 실패하는 버그가 있어 임시 경로를 사용합니다.
             temp_file_path = os.path.join(tempfile.gettempdir(), "temp_export_video.mp4")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+            # Windows 환경의 하드웨어 가속 H.264 코덱을 우선적으로 사용하여 BT.709 색공간 채도 저하 문제를 해결합니다.
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+            out_video = cv2.VideoWriter(temp_file_path, cv2.CAP_MSMF, fourcc, fps, (width, height))
 
+            # 만약 H264를 지원하지 않는다면 기존 mp4v로 폴백(Fallback)
             if not out_video.isOpened():
-                raise Exception("비디오 코덱을 초기화할 수 없습니다. mp4v 코덱을 지원하지 않을 수 있습니다.")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+                if not out_video.isOpened():
+                    raise Exception("비디오 코덱을 초기화할 수 없습니다. H264 및 mp4v 코덱을 지원하지 않습니다.")
 
             self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
             current_pos = self.trim_start_frame
@@ -1680,8 +2007,9 @@ class GolfTrackerApp(QMainWindow):
                 if not ret:
                     break
                     
-                # 원본 프레임만 자르기 저장
-                out_video.write(frame)
+                # 영상 색감을 화사하게 보정하여 저장
+                enhanced_frame = self.enhance_color(frame)
+                out_video.write(enhanced_frame)
                 
                 exported_count += 1
                 if exported_count % 10 == 0 or exported_count == total_export_frames:
@@ -1749,11 +2077,16 @@ class GolfTrackerApp(QMainWindow):
             
             temp_file_path = os.path.join(tempfile.gettempdir(), "temp_export_anim_video.mp4")
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+            # Windows 환경의 하드웨어 가속 H.264 코덱을 우선적으로 사용하여 BT.709 색공간 채도 저하 문제를 해결합니다.
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+            out_video = cv2.VideoWriter(temp_file_path, cv2.CAP_MSMF, fourcc, fps, (width, height))
 
+            # 만약 H264를 지원하지 않는다면 기존 mp4v로 폴백(Fallback)
             if not out_video.isOpened():
-                raise Exception("비디오 코덱을 초기화할 수 없습니다. mp4v 코덱을 지원하지 않을 수 있습니다.")
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out_video = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height))
+                if not out_video.isOpened():
+                    raise Exception("비디오 코덱을 초기화할 수 없습니다. H264 및 mp4v 코덱을 지원하지 않습니다.")
 
             self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.trim_start_frame)
             current_pos = self.trim_start_frame
@@ -1768,7 +2101,10 @@ class GolfTrackerApp(QMainWindow):
                     
                 # 애니메이션 궤적을 렌더링하여 프레임 자체에 합성(Bake-in)
                 processed_frame = self.process_frame(frame, export_mode=True)
-                out_video.write(processed_frame)
+                
+                # 합성된 최종 영상의 색감을 화사하게 보정하여 저장
+                enhanced_frame = self.enhance_color(processed_frame)
+                out_video.write(enhanced_frame)
                 
                 exported_count += 1
                 if exported_count % 10 == 0 or exported_count == total_export_frames:
@@ -1869,11 +2205,39 @@ class GolfTrackerApp(QMainWindow):
         if self.video_capture is not None and self.current_frame is not None:
             self.display_frame(self.process_frame(self.current_frame))
 
+    def enhance_color(self, frame):
+        """HDR 영상(10-bit HLG/PQ)이 일반 모니터(SDR)에서 물빠진 색감으로 보이는 현상을
+        개선하기 위해, 감마(Gamma) 및 채도를 빠르고 자연스럽게 복원합니다."""
+        # 속도 최적화를 위해 LUT(Look-Up Table) 캐싱
+        if not hasattr(self, '_gamma_lut'):
+            # 감마값을 1.15로 설정하여 약간 떠있는(물빠진) 블랙을 잡아주어 명암비를 복원
+            invGamma = 1.15
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            self._gamma_lut = table
+
+        # 1. 감마 곡선 적용 (대비 증가)
+        frame_gamma = cv2.LUT(frame, self._gamma_lut)
+        
+        # 2. 채도(Saturation) 20% 증가로 원본의 생생한 색감 복원
+        hsv = cv2.cvtColor(frame_gamma, cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.20, 0, 255)
+        enhanced_frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        
+        return enhanced_frame
+
     def display_frame(self, frame):
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        enhanced_frame = self.enhance_color(frame)
+        rgb_image = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2RGB)
+        
+        # OpenCV 이미지는 메모리가 비연속적일 수 있으므로 copy()를 통해 연속 메모리로 만들어야 안전합니다.
+        # 또한 QImage가 데이터를 참조하므로 garbage collection을 막기 위해 data.copy()를 하는 것이 좋습니다.
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        
+        # 복사본을 생성하여 QImage에 전달 (QImage가 참조하고 있는 동안 메모리가 해제/변경되는 문제 방지)
+        image_data = rgb_image.copy()
+        qt_image = QImage(image_data.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qt_image.ndarray = image_data # 참조 유지
         
         pixmap = QPixmap.fromImage(qt_image)
         scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)

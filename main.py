@@ -200,6 +200,22 @@ class GolfTrackerApp(QMainWindow):
         self.anim_mode_cb.setChecked(True)
         self.anim_mode_cb.setEnabled(False)
 
+        # 추정 궤적 선 보기 체크박스 (유추 궤적)
+        self.infer_trajectory_cb = QCheckBox("추정 궤적 선 보기")
+        self.infer_trajectory_cb.setChecked(False)
+        self.infer_trajectory_cb.setEnabled(False)
+
+        # 추정 궤적 길이 조절 슬라이더
+        self.infer_length_layout = QHBoxLayout()
+        self.infer_length_label = QLabel("예측 비행 시간: 1.5 초")
+        self.infer_length_label.setFixedWidth(150)
+        self.infer_length_slider = QSlider(Qt.Horizontal)
+        self.infer_length_slider.setRange(0, 50) # 0.0초 ~ 5.0초
+        self.infer_length_slider.setValue(15)
+        self.infer_length_slider.setEnabled(False)
+        self.infer_length_layout.addWidget(self.infer_length_label)
+        self.infer_length_layout.addWidget(self.infer_length_slider)
+
         # 애니메이션 스타일 선택 콤보박스
         self.anim_style_combo = QComboBox()
         self.anim_style_combo.addItems([
@@ -276,6 +292,8 @@ class GolfTrackerApp(QMainWindow):
         self.control_layout.addWidget(self.play_button)
         self.control_layout.addWidget(self.show_trajectory_cb)
         self.control_layout.addWidget(self.anim_mode_cb)
+        self.control_layout.addWidget(self.infer_trajectory_cb)
+        self.control_layout.addLayout(self.infer_length_layout)
         self.control_layout.addWidget(self.anim_style_combo)
         self.control_layout.addWidget(self.save_traj_button)
         self.control_layout.addWidget(self.load_traj_button)
@@ -344,6 +362,8 @@ class GolfTrackerApp(QMainWindow):
         self.play_button.clicked.connect(self.toggle_playback)
         self.show_trajectory_cb.toggled.connect(self.redraw_current_frame)
         self.anim_mode_cb.toggled.connect(self.redraw_current_frame)
+        self.infer_trajectory_cb.toggled.connect(self.redraw_current_frame)
+        self.infer_length_slider.valueChanged.connect(self.on_infer_length_changed)
         self.anim_style_combo.currentIndexChanged.connect(self.redraw_current_frame)
         self.save_traj_button.clicked.connect(self.export_trajectory)
         self.load_traj_button.clicked.connect(self.import_trajectory)
@@ -475,6 +495,8 @@ class GolfTrackerApp(QMainWindow):
                 self.play_button.setEnabled(True)
                 self.show_trajectory_cb.setEnabled(True)
                 self.anim_mode_cb.setEnabled(True)
+                self.infer_trajectory_cb.setEnabled(True)
+                self.infer_length_slider.setEnabled(True)
                 self.anim_style_combo.setEnabled(True)
                 self.timeline_slider.setEnabled(True)
                 self.save_traj_button.setEnabled(True)
@@ -531,6 +553,10 @@ class GolfTrackerApp(QMainWindow):
             if self.current_frame is not None:
                 self.display_frame(self.process_frame(self.current_frame))
         self.setFocus()
+
+    def on_infer_length_changed(self, value):
+        self.infer_length_label.setText(f"예측 비행 시간: {value / 10.0:.1f} 초")
+        self.redraw_current_frame()
 
     def get_trajectory_file_path(self, video_path):
         """비디오 파일명을 기반으로 궤적 파일 경로를 생성합니다."""
@@ -1174,10 +1200,11 @@ class GolfTrackerApp(QMainWindow):
         """수동으로 입력된 좌표를 기반으로 마커와 궤적을 그립니다."""
         is_show_all = self.show_trajectory_cb.isChecked()
         is_anim_mode = hasattr(self, 'anim_mode_cb') and self.anim_mode_cb.isChecked()
+        is_infer_mode = hasattr(self, 'infer_trajectory_cb') and self.infer_trajectory_cb.isChecked()
         anim_style = self.anim_style_combo.currentIndex() if hasattr(self, 'anim_style_combo') else 0
         
-        # 궤적 전체 보기와 애니메이션 모드가 모두 꺼져있다면 원본 프레임 반환
-        if not is_show_all and not is_anim_mode:
+        # 궤적 전체 보기와 애니메이션 모드, 추정 궤적이 모두 꺼져있다면 원본 프레임 반환
+        if not is_show_all and not is_anim_mode and not is_infer_mode:
             return frame
             
         display_frame = frame.copy()
@@ -1205,7 +1232,7 @@ class GolfTrackerApp(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
         # 2. 궤적 그리기 (체크박스 옵션에 따라 선 연결)
-        if (is_show_all or is_anim_mode) and self.trajectory:
+        if (is_show_all or is_anim_mode or is_infer_mode) and self.trajectory:
             all_sorted_frames = sorted(self.trajectory.keys())
             all_points = [self.trajectory[idx] for idx in all_sorted_frames]
             
@@ -1870,6 +1897,106 @@ class GolfTrackerApp(QMainWindow):
                                                 end_x = int(p2[0] + nx*ox*side - ux*random.randint(0, 10))
                                                 end_y = int(p2[1] + ny*ox*side - uy*random.randint(0, 10))
                                                 cv2.line(display_frame, (start_x, start_y), (end_x, end_y), (0, 200, 255), 1)
+
+            # --- 추가된 추정 궤적 선 그리기 ---
+            if is_infer_mode and len(all_points) >= 3:
+                try:
+                    from scipy.interpolate import splprep, splev
+                    
+                    t_data = np.array(all_sorted_frames, dtype=float)
+                    t_norm = t_data - t_data[0] # 시작 시간을 0으로 정규화
+                    t_last = t_norm[-1]
+                    
+                    x_data = np.array([p[0] for p in all_points], dtype=float)
+                    y_data = np.array([p[1] for p in all_points], dtype=float)
+                    pts = np.column_stack((x_data, y_data))
+                    
+                    # [골프공 비행 특화 예측 알고리즘 - 유연한 스무딩 스플라인 (B-Spline)]
+                    # 완전히 고정된 포물선은 실제 궤적(바람, 카메라 왜곡 등)과 너무 어긋나고,
+                    # 점을 100% 관통하는 스플라인은 마우스 클릭 오차 때문에 뱀처럼 꼬불거립니다.
+                    # 이를 해결하기 위해 '적당히 부드러우면서도 점들을 최대한 가깝게 따라가는' 스무딩 스플라인을 사용합니다.
+                    
+                    k = min(3, len(all_points) - 1)
+                    # s(Smoothing Factor) 조절: 점이 많을수록 부드럽게 깎아내어 손떨림(노이즈)을 보정합니다.
+                    smoothing_factor = len(all_points) * 1.5 
+                    
+                    if t_last > 0:
+                        u_custom = t_norm / t_last
+                        tck, u = splprep([pts[:, 0], pts[:, 1]], u=u_custom, s=smoothing_factor, k=k)
+                    else:
+                        tck, u = splprep([pts[:, 0], pts[:, 1]], s=smoothing_factor, k=k)
+                        
+                    # 1. 과거~현재 구간 곡선 생성
+                    u_past = np.linspace(0, 1.0, max(20, int(t_last) * 2 + 1))
+                    inf_x_past, inf_y_past = splev(u_past, tck)
+                    
+                    # 2. 미래 예측으로 넘겨줄 마지막 순간의 속도(기울기) 계산 (연결부 꺾임 완벽 방지)
+                    if t_last > 0:
+                        dx_du, dy_du = splev(1.0, tck, der=1) # u=1.0에서의 1차 미분
+                        vx_last = dx_du / t_last
+                        vy_last = dy_du / t_last
+                    else:
+                        vx_last, vy_last = 0.0, 0.0
+                        
+                    # 3. 물리적 가속도(a)를 구하기 위한 전역 2차식 피팅 (중력 및 공기저항 모델링)
+                    poly_x_base = np.polyfit(t_norm, x_data, 2)
+                    poly_y_base = np.polyfit(t_norm, y_data, 2)
+                    
+                    ay = poly_y_base[0]
+                    ax = poly_x_base[0]
+
+                    # [핵심 물리 제약] 공은 무조건 땅으로 떨어져야 합니다.
+                    if ay < 0.05: 
+                        ay = 0.05 # 하늘로 치솟는 것을 방지하는 최소한의 중력 부여
+                        
+                    if (vx_last * ax > 0) or abs(ax) > 0.5: 
+                        ax = 0.0 # 공기저항 외에 가속 불가
+                        
+                    # 4. 미래 예측 궤적 생성 (물리 법칙 s = v*t + a*t^2 적용)
+                    # 슬라이더 값(0.1초 단위)을 프레임으로 변환합니다.
+                    future_seconds = float(self.infer_length_slider.value()) / 10.0 if hasattr(self, 'infer_length_slider') else 1.5
+                    
+                    if future_seconds == 0.0:
+                        inf_x = inf_x_past
+                        inf_y = inf_y_past
+                    else:
+                        fps = self.video_capture.get(cv2.CAP_PROP_FPS) if self.video_capture else 30.0
+                        if fps == 0: fps = 30.0
+                        future_frames = future_seconds * fps
+                        
+                        # C1 연속성(기울기 동일)을 유지하며 부드럽게 연장
+                        dt_future = np.linspace(0, future_frames, max(10, int(future_frames)))
+                        # 마지막 점의 위치에서부터 물리법칙으로 시작
+                        last_x, last_y = inf_x_past[-1], inf_y_past[-1]
+                        inf_x_future = last_x + vx_last * dt_future + ax * (dt_future ** 2)
+                        inf_y_future = last_y + vy_last * dt_future + ay * (dt_future ** 2)
+                        
+                        # 마그누스 효과 (정점 지나 하강 시 더 가파르게)
+                        current_vy = vy_last + 2 * ay * dt_future
+                        falling_mask = current_vy > 0
+                        if np.any(falling_mask):
+                            inf_y_future[falling_mask] += 0.05 * ay * (dt_future[falling_mask] ** 2)
+                            
+                        # 5. 과거(스무딩 스플라인)와 미래(물리적 예측) 궤적 결합
+                        inf_x = np.concatenate((inf_x_past, inf_x_future[1:]))
+                        inf_y = np.concatenate((inf_y_past, inf_y_future[1:]))
+                    
+                    h, w = display_frame.shape[:2]
+                    valid_mask = (inf_x >= -w) & (inf_x <= w*2) & (inf_y >= -h) & (inf_y <= h*2)
+                    inf_pts = np.column_stack((inf_x[valid_mask], inf_y[valid_mask]))
+                    
+                    if len(inf_pts) > 1:
+                        inf_curve = np.int32(inf_pts).reshape((-1, 2))
+                        step = 8
+                        gap = 6
+                        # 점선 형태로 예쁘게 렌더링
+                        for i in range(0, len(inf_curve) - step, step + gap):
+                            p1 = (inf_curve[i][0], inf_curve[i][1])
+                            p2 = (inf_curve[i+step][0], inf_curve[i+step][1])
+                            cv2.line(display_frame, p1, p2, (255, 50, 255), 3) # 아웃라인
+                            cv2.line(display_frame, p1, p2, (255, 255, 255), 1) # 인라인
+                except Exception as e:
+                    print(f"Inference error: {e}")
 
         # 3. 다음 프레임 위치 예측 (현재까지의 궤적을 기반으로)
         if self.is_tracking and not export_mode:
